@@ -1,0 +1,49 @@
+CC ?= cc
+AR ?= ar
+CFLAGS ?= -std=c11 -O3 -fPIC -Wall -Wextra -Wpedantic
+CPPFLAGS += -Iinclude -Isrc -Isrc/libretro
+GP32EMU_ENABLE_THREADS ?= 1
+CPPFLAGS += -DGP32EMU_ENABLE_THREADS=$(GP32EMU_ENABLE_THREADS)
+ifeq ($(GP32EMU_ENABLE_THREADS),1)
+THREAD_CFLAGS ?= -pthread
+THREAD_LIBS ?= -pthread
+else
+THREAD_CFLAGS ?=
+THREAD_LIBS ?=
+endif
+UNAME_S := $(shell uname -s 2>/dev/null)
+ifeq ($(UNAME_S),Darwin)
+LIBRETRO_EXT ?= dylib
+SHARED_FLAGS ?= -dynamiclib
+else
+LIBRETRO_EXT ?= so
+SHARED_FLAGS ?= -shared -Wl,--no-undefined
+endif
+TARGET_NAME ?= gp32emu_libretro
+TARGET_FILE := $(TARGET_NAME).$(LIBRETRO_EXT)
+CORE_OBJS = \
+ src/gp32.o \
+ src/arm920t.o \
+ src/s3c2400.o \
+ src/smartmedia.o \
+ src/smc_direct.o \
+ src/fxe.o \
+ src/fpk.o \
+ src/zip.o \
+ src/third_party/zip/zip.o \
+ src/platform/platform.o \
+ src/audio/gp32_audio_resampler.o \
+ src/media/gp32_media.o \
+ src/media/gp32_video_effects.o
+LIBRETRO_OBJS = src/libretro/libretro.o
+ZIPLIB_CFLAGS ?= $(filter-out -Werror,$(CFLAGS)) -D_XOPEN_SOURCE=700 -D_FILE_OFFSET_BITS=64 -DZIP_ENABLE_DEFLATE=0 -DZIP_HAVE_SYMLINK=0 -w
+.PHONY: all clean
+all: $(TARGET_FILE)
+$(TARGET_FILE): $(CORE_OBJS) $(LIBRETRO_OBJS)
+	$(CC) $(SHARED_FLAGS) -o $@ $^ $(THREAD_LIBS) -lm
+src/third_party/zip/zip.o: src/third_party/zip/zip.c src/third_party/zip/zip.h src/third_party/zip/miniz.h
+	$(CC) $(ZIPLIB_CFLAGS) $(THREAD_CFLAGS) $(CPPFLAGS) -c -o $@ $<
+%.o: %.c
+	$(CC) $(CFLAGS) $(THREAD_CFLAGS) $(CPPFLAGS) -c -o $@ $<
+clean:
+	rm -f $(CORE_OBJS) $(LIBRETRO_OBJS) $(TARGET_FILE)

@@ -1,0 +1,96 @@
+CC ?= cc
+AR ?= ar
+SDL_CONFIG ?= sdl-config
+CFLAGS ?= -std=c11 -O3 -g -Wall -Wextra -Wpedantic
+CPPFLAGS += -Iinclude -Isrc
+GP32EMU_ENABLE_THREADS ?= 1
+CPPFLAGS += -DGP32EMU_ENABLE_THREADS=$(GP32EMU_ENABLE_THREADS)
+ifeq ($(GP32EMU_ENABLE_THREADS),1)
+THREAD_CFLAGS ?= -pthread
+THREAD_LIBS ?= -pthread
+else
+THREAD_CFLAGS ?=
+THREAD_LIBS ?=
+endif
+
+LIB_OBJS = \
+	src/gp32.o \
+	src/arm920t.o \
+	src/s3c2400.o \
+	src/smartmedia.o \
+	src/smc_direct.o \
+	src/fxe.o \
+	src/fpk.o \
+	src/zip.o \
+	src/third_party/zip/zip.o \
+	src/input_script.o \
+	src/platform/platform.o \
+	src/audio/gp32_audio_resampler.o \
+	src/media/gp32_media.o \
+	src/media/gp32_video_effects.o
+
+CLI_OBJS = src/headless_main.o
+SDL12_OBJS = \
+	src/sdl12_main.o \
+	src/platform/sdl12/common.o \
+	src/platform/sdl12/video.o \
+	src/platform/sdl12/audio.o \
+	src/platform/sdl12/input.o
+
+SDL3_OBJS = \
+	src/sdl3_main.o \
+	src/platform/sdl3/common.o \
+	src/platform/sdl3/video.o \
+	src/platform/sdl3/audio.o \
+	src/platform/sdl3/input.o \
+	src/input/gp32_sdl3_input_shared.o
+
+SDL_CFLAGS ?= $(shell $(SDL_CONFIG) --cflags 2>/dev/null)
+SDL_LIBS ?= $(shell $(SDL_CONFIG) --libs 2>/dev/null)
+SDL3_CFLAGS ?= $(shell pkg-config --cflags sdl3 2>/dev/null)
+SDL3_LIBS ?= $(shell pkg-config --libs sdl3 2>/dev/null)
+ZIPLIB_CFLAGS ?= $(filter-out -Werror,$(CFLAGS)) -D_XOPEN_SOURCE=700 -D_FILE_OFFSET_BITS=64 -DZIP_ENABLE_DEFLATE=0 -DZIP_HAVE_SYMLINK=0 -w
+
+.PHONY: all clean sdl12 sdl3 check-sdl12 check-sdl3
+all: libgp32emu.a gp32_headless
+
+libgp32emu.a: $(LIB_OBJS)
+	$(AR) rcs $@ $^
+
+gp32_headless: $(CLI_OBJS) libgp32emu.a
+	$(CC) $(CFLAGS) $(THREAD_CFLAGS) $(CPPFLAGS) -o $@ $(CLI_OBJS) libgp32emu.a $(THREAD_LIBS)
+
+check-sdl12:
+	@if ! command -v $(SDL_CONFIG) >/dev/null 2>&1; then \
+		echo "SDL 1.2 development files not found: $(SDL_CONFIG) is unavailable."; \
+		echo "Install SDL 1.2 or pass SDL_CONFIG=/path/to/sdl-config, then run: make -f Makefile.sdl sdl12"; \
+		exit 1; \
+	fi
+
+sdl12: check-sdl12 gp32_sdl12
+
+check-sdl3:
+	@if [ -z "$(SDL3_CFLAGS)$(SDL3_LIBS)" ]; then \
+		echo "SDL3 development files not found via pkg-config."; \
+		echo "Install SDL3 or pass SDL3_CFLAGS/SDL3_LIBS, then run: make sdl3"; \
+		exit 1; \
+	fi
+
+sdl3: check-sdl3 gp32_sdl3
+
+gp32_sdl12: CPPFLAGS += $(SDL_CFLAGS)
+gp32_sdl12: $(SDL12_OBJS) libgp32emu.a
+	$(CC) $(CFLAGS) $(THREAD_CFLAGS) $(CPPFLAGS) -o $@ $(SDL12_OBJS) libgp32emu.a $(SDL_LIBS) $(THREAD_LIBS)
+
+gp32_sdl3: CPPFLAGS += $(SDL3_CFLAGS)
+gp32_sdl3: $(SDL3_OBJS) libgp32emu.a
+	$(CC) $(CFLAGS) $(THREAD_CFLAGS) $(CPPFLAGS) -o $@ $(SDL3_OBJS) libgp32emu.a $(SDL3_LIBS) $(THREAD_LIBS)
+
+src/third_party/zip/zip.o: src/third_party/zip/zip.c src/third_party/zip/zip.h src/third_party/zip/miniz.h
+	$(CC) $(ZIPLIB_CFLAGS) $(THREAD_CFLAGS) $(CPPFLAGS) -c -o $@ $<
+
+%.o: %.c
+	$(CC) $(CFLAGS) $(THREAD_CFLAGS) $(CPPFLAGS) -c -o $@ $<
+
+clean:
+	rm -f $(LIB_OBJS) $(CLI_OBJS) $(SDL12_OBJS) $(SDL3_OBJS) libgp32emu.a gp32_headless gp32_sdl12 gp32_sdl3

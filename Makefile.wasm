@@ -1,0 +1,57 @@
+# WebAssembly GP32emu build. Uses the portable ARM bytecode interpreter; native x64 JIT is intentionally unavailable for WASM.
+WASM_CC ?= clang
+WASM_LD ?= wasm-ld
+PORT ?= 8008
+OUT_DIR := web
+OUT_WASM := $(OUT_DIR)/gp32_wasm_core.wasm
+BUILD_DIR := build-wasm
+
+WASM_CFLAGS := --target=wasm32-unknown-unknown -O3 -g0 -std=c11 -DGP32EMU_WASM=1 -DGP32EMU_ENABLE_THREADS=0 -D__STDC_HOSTED__=0 \
+  -DARM_JIT_BLOCK_COUNT=32768 -DARM_JIT_MAX_INSNS=96 \
+  -Iwasm/libc/include -Iinclude -Isrc -Wall -Wextra -Wno-unused-parameter -Wno-implicit-function-declaration \
+  -Wno-builtin-macro-redefined -ffunction-sections -fdata-sections
+WASM_LDFLAGS := --no-entry --export-memory --initial-memory=134217728 --max-memory=268435456 --allow-undefined --gc-sections
+WASM_EXPORTS := \
+  --export=gp32_wasm_version --export=gp32_wasm_malloc --export=gp32_wasm_heap_used --export=gp32_wasm_reset_heap --export=gp32_wasm_init \
+  --export=gp32_wasm_load_bios --export=gp32_wasm_load_media --export=gp32_wasm_start --export=gp32_wasm_soft_reset --export=gp32_wasm_frame --export=gp32_wasm_run_frames \
+  --export=gp32_wasm_set_input --export=gp32_wasm_set_video_effects --export=gp32_wasm_save_state --export=gp32_wasm_get_save_ptr --export=gp32_wasm_get_save_size --export=gp32_wasm_load_state \
+  --export=gp32_wasm_get_status --export=gp32_wasm_get_error --export=gp32_wasm_get_error_ptr \
+  --export=gp32_wasm_get_frame_count --export=gp32_wasm_get_width --export=gp32_wasm_get_height --export=gp32_wasm_get_pitch_bytes \
+  --export=gp32_wasm_get_framebuffer --export=gp32_wasm_get_audio_rate --export=gp32_wasm_get_audio_ptr --export=gp32_wasm_get_audio_frames --export=gp32_wasm_audio_consume \
+  --export=gp32_wasm_get_pc --export=gp32_wasm_get_cycles_lo --export=gp32_wasm_has_bios --export=gp32_wasm_has_media \
+  --export=pcfx_wasm_vfs_clear --export=pcfx_wasm_vfs_add_file --export=pcfx_wasm_vfs_add_host_file --export=pcfx_wasm_vfs_count
+
+CORE_SRCS := \
+  src/arm920t.c \
+  src/s3c2400.c \
+  src/smartmedia.c \
+  src/smc_direct.c \
+  src/fxe.c \
+  src/fpk.c \
+  src/gp32.c \
+  src/audio/gp32_audio_resampler.c \
+  src/media/gp32_video_effects.c \
+  wasm/libc/src/pcfx_wasm_libc.c \
+  wasm/gp32_wasm_core.c
+OBJS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(CORE_SRCS))
+
+.PHONY: all build clean serve
+all: build
+build: $(OUT_WASM)
+
+$(OUT_WASM): $(OBJS) | $(OUT_DIR)
+	$(WASM_LD) $(WASM_LDFLAGS) $(WASM_EXPORTS) -o $@ $(OBJS)
+
+$(BUILD_DIR)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(WASM_CC) $(WASM_CFLAGS) -c $< -o $@
+
+$(OUT_DIR):
+	mkdir -p $(OUT_DIR)
+
+serve: build
+	@echo "Serving $(OUT_DIR) at http://127.0.0.1:$(PORT)/"
+	python3 -m http.server $(PORT) --directory $(OUT_DIR)
+
+clean:
+	rm -rf $(BUILD_DIR) $(OUT_WASM)

@@ -1,0 +1,35 @@
+# Linux build convenience wrapper for GP32emu.
+# Qt6/qmake creates the root Makefile; SDL/headless builds live in Makefile.sdl.
+
+QMAKE ?= qmake6
+JOBS ?= $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)
+
+.PHONY: all qt appimage appmake sdl sdl3 headless clean distclean
+
+all: qt
+
+qt:
+	@command -v $(QMAKE) >/dev/null 2>&1 || { echo "Qt6 qmake not found: $(QMAKE). Set QMAKE=/path/to/qmake6" >&2; exit 1; }
+	$(QMAKE) GP32emu.pro
+	$(MAKE) -j$(JOBS)
+
+appimage appmake:
+	packaging/make_appimage.sh
+
+headless:
+	$(MAKE) -f Makefile.sdl all
+
+sdl:
+	$(MAKE) -f Makefile.sdl sdl12
+
+sdl3:
+	$(MAKE) -f Makefile.sdl sdl3
+
+clean:
+	@if [ -f Makefile ]; then $(MAKE) -f Makefile clean || true; fi
+	$(MAKE) -f Makefile.sdl clean || true
+
+# Remove qmake-generated files so GP32emu.pro can regenerate the root Makefile.
+distclean: clean
+	rm -f Makefile .qmake.stash moc_*.cpp qrc_*.cpp ui_*.h GP32emu
+	rm -rf build-appimage

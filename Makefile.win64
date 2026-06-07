@@ -1,0 +1,138 @@
+# Win64-only GP32emu UI build. No Win32 build is provided because the x64
+# dynarec is required for acceptable speed.
+#
+# Cross-build from Linux with MinGW-w64:
+#   make -f Makefile.win64
+#
+# The app target builds bundled SDL3 as a static Win64 library first, then links
+# D3D11/GDI video, waveOut/WASAPI audio, and SDL3 joystick input.
+
+THIS_MAKEFILE := $(lastword $(MAKEFILE_LIST))
+ROOT := $(abspath $(dir $(THIS_MAKEFILE)))
+
+ifeq ($(origin CC),default)
+CC := x86_64-w64-mingw32-gcc
+endif
+ifeq ($(origin CXX),default)
+CXX := x86_64-w64-mingw32-g++
+endif
+ifeq ($(origin RC),undefined)
+RC := x86_64-w64-mingw32-windres
+endif
+ifeq ($(origin WINDRES),undefined)
+WINDRES := $(RC)
+endif
+ifeq ($(origin AR),default)
+AR := x86_64-w64-mingw32-ar
+endif
+ifeq ($(origin PKG_CONFIG),default)
+PKG_CONFIG := x86_64-w64-mingw32-pkg-config
+endif
+ifeq ($(origin PKG_CONFIG),undefined)
+PKG_CONFIG := x86_64-w64-mingw32-pkg-config
+endif
+
+TARGET := $(ROOT)/GP32emu-win64.exe
+BUILD := $(ROOT)/build/win64
+SDL_PREFIX := $(ROOT)/third_party/sdl/install/win64
+SDL_PC := $(SDL_PREFIX)/lib/pkgconfig
+SDL_CFLAGS_PKG := $(shell PKG_CONFIG_LIBDIR="$(SDL_PC)" PKG_CONFIG_PATH= $(PKG_CONFIG) --cflags sdl3 2>/dev/null)
+SDL_LIBS_PKG := $(shell PKG_CONFIG_LIBDIR="$(SDL_PC)" PKG_CONFIG_PATH= $(PKG_CONFIG) --libs --static sdl3 2>/dev/null)
+SDL_CFLAGS := -I$(SDL_PREFIX)/include $(SDL_CFLAGS_PKG)
+ifeq ($(strip $(SDL_LIBS_PKG)),)
+SDL_LIBS := -L$(SDL_PREFIX)/lib -lSDL3 -lm -lkernel32 -luser32 -lgdi32 -lwinmm -limm32 -lole32 -loleaut32 -lversion -luuid -ladvapi32 -lsetupapi -lshell32 -lhid -ldinput8 -ldxguid -lcfgmgr32
+else
+SDL_LIBS := -L$(SDL_PREFIX)/lib $(SDL_LIBS_PKG)
+endif
+
+GP32EMU_ENABLE_THREADS ?= 1
+DEFS := -DGP32EMU_ENABLE_THREADS=$(GP32EMU_ENABLE_THREADS) -DGP32EMU_WIN64_FRONTEND=1 -DSDL_MAIN_HANDLED=1 -DWIN32_LEAN_AND_MEAN=1 -DNOMINMAX=1 -D_CRT_SECURE_NO_WARNINGS=1 -D_WIN32_WINNT=0x0601
+INCLUDES := -I$(ROOT)/include -I$(ROOT)/src
+CFLAGS ?= -std=c11 -O3 -g -Wall -Wextra -Wno-unused-parameter
+CPPFLAGS += $(DEFS) $(INCLUDES) $(SDL_CFLAGS)
+ZIPLIB_CFLAGS ?= $(filter-out -Werror,$(CFLAGS)) -D_XOPEN_SOURCE=700 -D_FILE_OFFSET_BITS=64 -DZIP_ENABLE_DEFLATE=0 -DZIP_HAVE_SYMLINK=0 -w
+LDFLAGS ?= -static -static-libgcc -mwindows
+LDLIBS := $(SDL_LIBS) -ld3d11 -ldxgi -ldxguid -lgdi32 -lwinmm -lole32 -loleaut32 -luuid -lavrt -lksuser -lcomctl32 -lcomdlg32 -lshell32 -luser32 -ladvapi32 -lbcrypt -lws2_32 -lm
+
+CORE_SRC := \
+  src/gp32.c \
+  src/arm920t.c \
+  src/s3c2400.c \
+  src/smartmedia.c \
+  src/smc_direct.c \
+  src/fxe.c \
+  src/fpk.c \
+  src/zip.c \
+  src/third_party/zip/zip.c \
+  src/input_script.c \
+  src/platform/platform.c \
+  src/audio/gp32_audio_resampler.c \
+  src/media/gp32_media.c \
+  src/media/gp32_video_effects.c
+
+WIN64_SRC := \
+  src/win64/gp32_win64_main.c \
+  src/win64/gp32_win64_video.c \
+  src/win64/gp32_win64_audio.c \
+  src/win64/gp32_win64_sdl_input.c \
+  src/input/gp32_sdl3_input_shared.c
+
+OBJ := $(patsubst %.c,$(BUILD)/%.o,$(CORE_SRC) $(WIN64_SRC))
+ICON_RC := $(BUILD)/gp32emu_icon.rc
+ICON_RES := $(BUILD)/gp32emu_icon.res.o
+
+.DEFAULT_GOAL := all
+.PHONY: all app sdl check-toolchain check-resource-toolchain check-sdl clean sdl-clean
+
+all: app
+app: $(TARGET)
+
+check-toolchain:
+	@command -v $(CC) >/dev/null 2>&1 || { \
+		echo "missing MinGW-w64 64-bit C compiler: $(CC)" >&2; \
+		echo "Install x86_64 MinGW-w64 or run: make -f Makefile.win64 CC=/path/to/x86_64-w64-mingw32-gcc" >&2; \
+		exit 1; \
+	}
+	@command -v $(CXX) >/dev/null 2>&1 || { \
+		echo "missing MinGW-w64 64-bit C++ compiler: $(CXX)" >&2; \
+		echo "SDL3's CMake build requires the matching MinGW-w64 C++ compiler." >&2; \
+		exit 1; \
+	}
+
+check-resource-toolchain:
+	@command -v $(WINDRES) >/dev/null 2>&1 || { \
+		echo "missing MinGW-w64 64-bit resource compiler: $(WINDRES)" >&2; \
+		echo "Install windres or run: make -f Makefile.win64 WINDRES=/path/to/x86_64-w64-mingw32-windres" >&2; \
+		exit 1; \
+	}
+
+sdl: check-toolchain check-resource-toolchain
+	CC="$(CC)" CXX="$(CXX)" RC="$(WINDRES)" $(ROOT)/scripts/build_sdl3_mingw.sh win64
+
+check-sdl: sdl
+	@test -f "$(SDL_PREFIX)/include/SDL3/SDL.h" || { echo "SDL3 headers missing; run: make -f Makefile.win64 sdl" >&2; exit 1; }
+	@test -f "$(SDL_PREFIX)/lib/libSDL3.a" || { echo "SDL3 static library missing; run: make -f Makefile.win64 sdl" >&2; exit 1; }
+
+$(TARGET): $(OBJ) $(ICON_RES) | check-sdl check-resource-toolchain
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+$(ICON_RC): resources/gp32emu.ico | check-resource-toolchain
+	@mkdir -p $(dir $@)
+	printf '101 ICON "%s"\n' "$(abspath $<)" > $@
+
+$(ICON_RES): $(ICON_RC)
+	$(WINDRES) --codepage=65001 --output-format=coff --target=pe-x86-64 -i $< -o $@
+
+$(BUILD)/src/third_party/zip/zip.o: src/third_party/zip/zip.c src/third_party/zip/zip.h src/third_party/zip/miniz.h | check-sdl
+	@mkdir -p $(dir $@)
+	$(CC) $(ZIPLIB_CFLAGS) $(CPPFLAGS) -c -o $@ $<
+
+$(BUILD)/%.o: %.c | check-sdl
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c -o $@ $<
+
+clean:
+	rm -rf $(BUILD) $(TARGET) $(ROOT)/third_party/sdl/build/win64
+
+sdl-clean:
+	rm -rf $(ROOT)/third_party/sdl/build/win64 $(ROOT)/third_party/sdl/install/win64

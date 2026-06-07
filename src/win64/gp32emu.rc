@@ -1,0 +1,3 @@
+#include <windows.h>
+#define IDI_GP32EMU 101
+IDI_GP32EMU ICON "../../resources/gp32emu.ico"

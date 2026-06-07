@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <title>GP32emu WASM</title>
+  <link rel="icon" href="favicon.ico">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <main class="stage" id="dropZone">
+    <button id="fullscreenToggle" class="fullscreen-toggle" type="button" aria-label="Enter fullscreen" title="Enter fullscreen"></button>
+    <button id="menuToggle" class="menu-toggle" type="button" aria-label="Open controls panel">☰</button>
+    <div class="screen-wrap" tabindex="0" id="screenWrap" aria-label="GP32 video output">
+      <canvas id="screen" width="320" height="240"></canvas>
+      <div class="hud" id="hud" hidden aria-hidden="true">GP32emu WASM</div>
+      <div id="touchGamepad" class="touch-gamepad" aria-hidden="true">
+        <button type="button" class="touch-shoulder left" data-touch-btn="L"><span>L</span></button>
+        <button type="button" class="touch-shoulder right" data-touch-btn="R"><span>R</span></button>
+        <div id="touchDpad" class="touch-dpad" aria-label="Virtual D-pad">
+          <span class="touch-cardinal up">▲</span>
+          <span class="touch-cardinal right">▶</span>
+          <span class="touch-cardinal down">▼</span>
+          <span class="touch-cardinal left">◀</span>
+          <div id="touchKnob" class="touch-knob"></div>
+        </div>
+        <div class="touch-center-controls">
+          <button type="button" class="touch-system" data-touch-btn="Select"><span>SEL</span></button>
+          <button type="button" class="touch-system" data-touch-btn="Start"><span>START</span></button>
+        </div>
+        <div class="touch-actions" aria-label="Virtual action buttons">
+          <button type="button" class="touch-action secondary" data-touch-btn="B"><span>B</span></button>
+          <button type="button" class="touch-action primary" data-touch-btn="A"><span>A</span></button>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <aside class="panel" id="panel">
+    <header class="panel-head">
+      <div>
+        <h1>GP32emu</h1>
+        <p>WebAssembly frontend using the portable ARM bytecode interpreter.</p>
+      </div>
+      <button id="panelClose" class="panel-close" type="button" aria-label="Close controls panel">×</button>
+    </header>
+
+    <section>
+      <h2>Load</h2>
+      <label class="file-button">Load BIOS
+        <input id="biosFile" type="file" accept=".bin,.rom,.bios">
+      </label>
+      <label class="file-button">Load SMC / FXE / FPK
+        <input id="gameFile" type="file" accept=".smc,.fpk,.fxe,.gxb,.gxe,.bin">
+      </label>
+      <label class="check-row"><input id="hleMode" type="checkbox"> Use HLE BIOS for game launch</label>
+      <p class="hint">Without a BIOS, HLE is used automatically. HLE is mainly for homebrew and direct-load-compatible titles.</p>
+      <div class="row"><button id="startBtn" type="button">Start / Reset</button><button id="pauseBtn" type="button">Pause</button></div>
+    </section>
+
+    <section>
+      <h2>Save states</h2>
+      <div class="row state-row">
+        <select id="stateSlot" aria-label="Save state slot"></select>
+        <button id="saveStateBtn" type="button">Save</button>
+        <button id="loadStateBtn" type="button">Load</button>
+        <button id="exportStateBtn" type="button">Export</button>
+      </div>
+      <p id="storageText" class="hint">IndexedDB initializes after the WASM module loads.</p>
+    </section>
+
+
+
+    <section>
+      <h2>Video</h2>
+      <label class="field-label">Scaling
+        <select id="scaleMode" aria-label="Video scaling mode">
+          <option value="integer">Integer scale</option>
+          <option value="aspect">Keep aspect</option>
+          <option value="stretch">Stretch</option>
+        </select>
+      </label>
+      <label class="field-label">Filter
+        <select id="filterMode" aria-label="Video filter mode">
+          <option value="nearest">Nearest neighbor</option>
+          <option value="linear">Linear</option>
+          <option value="sharp-bilinear">Sharp bilinear</option>
+        </select>
+      </label>
+      <label class="check-row"><input id="lcdPersistence" type="checkbox"> LCD persistence / FLU ghosting</label>
+      <label class="check-row"><input id="frameInterpolation" type="checkbox"> Frame interpolation blend</label>
+      <label class="check-row"><input id="pauseWhenHidden" type="checkbox"> Pause while tab is inactive</label>
+      <p class="hint">LCD persistence and frame interpolation are off by default. Sharp bilinear first scales to an integer-sized framebuffer, then lets the browser do the fractional pass. This keeps pixels crisp while reducing shimmer during smooth scrolling.</p>
+    </section>
+
+    <section>
+      <h2>Input</h2>
+      <div class="controls" aria-label="Desktop pointer controls">
+        <button type="button" data-btn="64">↑</button>
+        <button type="button" data-btn="256">←</button>
+        <button type="button" data-btn="512">→</button>
+        <button type="button" data-btn="128">↓</button>
+        <button type="button" data-btn="1">A</button>
+        <button type="button" data-btn="2">B</button>
+        <button type="button" data-btn="4">L</button>
+        <button type="button" data-btn="8">R</button>
+        <button type="button" data-btn="16">Start</button>
+        <button type="button" data-btn="32">Select</button>
+      </div>
+      <p class="hint">Click a keyboard mapping below, then press a key. Escape cancels remapping.</p>
+      <div id="keyBindings" class="key-bindings"></div>
+      <div class="row"><button id="resetKeyMap" type="button">Reset keyboard</button></div>
+      <div class="controller-box">
+        <label class="field-label">Controller
+          <select id="gamepadSelect" aria-label="Gamepad controller selection"><option value="-1">Auto detect</option></select>
+        </label>
+        <p id="gamepadText" class="hint">Gamepad API initializes after page load.</p>
+        <p class="hint">Click a controller mapping, then press a controller button or move an axis. Escape cancels remapping.</p>
+        <div id="gamepadBindings" class="key-bindings gamepad-bindings"></div>
+        <div class="row"><button id="resetGamepadMap" type="button">Reset controller</button></div>
+      </div>
+      <div class="touch-options">
+        <label class="check-row touch-overlay-row"><input id="touchOverlayEnabled" type="checkbox"> Show mobile control overlay</label>
+        <label>Mobile control opacity
+          <input id="touchOpacity" type="range" min="25" max="100" step="5">
+        </label>
+      </div>
+    </section>
+
+    <section>
+      <h2>Status</h2>
+      <dl class="status-grid">
+        <dt>State</dt><dd id="stateText">not loaded</dd>
+        <dt>Frame</dt><dd id="frameText">0</dd>
+        <dt>PC</dt><dd id="pcText">00000000</dd>
+        <dt>Audio</dt><dd id="audioText">stopped</dd>
+        <dt>Controller</dt><dd id="gamepadStatusText">browser API</dd>
+      </dl>
+      <label class="check-row fps-hud-row"><input id="fpsHudEnabled" type="checkbox"> Show FPS/PC overlay on video</label>
+      <pre id="log"></pre>
+    </section>
+  </aside>
+</div>
+<script type="module" src="gp32-wasm.js"></script>
+</body>
+</html>

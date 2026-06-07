@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=GP32emu
+Comment=Game Park GP32 emulator
+Exec=GP32emu %f
+Icon=gp32emu
+Terminal=false
+Categories=Game;Emulator;
+MimeType=application/x-gp32-smc;application/x-gp32-fxe;

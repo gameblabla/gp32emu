@@ -1,0 +1,6 @@
+<RCC>
+  <qresource prefix="/">
+    <file alias="gp32emu.png">gp32emu.png</file>
+    <file alias="favicon.ico">favicon.ico</file>
+  </qresource>
+</RCC>
