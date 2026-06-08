@@ -1003,31 +1003,43 @@ void s3c2400_audio_append_s16_stereo(s3c2400_t *s, int16_t left, int16_t right, 
 }
 
 
-static uint32_t lcd_current_line_count(const s3c2400_t *s) {
-    if (!s) return 0u;
+static uint32_t lcd_visible_lines(const s3c2400_t *s) {
+    if (!s) return 320u;
     uint32_t lineval = GP32_BITS(s->lcd_regs[1], 23, 14);
     uint32_t visible = lineval + 1u;
     if (visible == 0u || visible > 1024u) visible = 320u;
+    return visible;
+}
 
-    uint32_t fclk = clk_fclk(s, MPLLCON);
-    if (!fclk) fclk = 66000000u;
-
-    /*
-     * LCDCON1[27:18] is polled by the GP32 BIOS and by BIOS-booted games as
-     * a vblank/status countdown.  Do not derive this field from the raw
-     * programmed VCLK/porch values: several commercial titles program LCDCON
-     * values that decode to an about-89 Hz controller cadence, and their BIOS
-     * boot path then services streamed IIS/DMA audio too slowly or at the
-     * wrong time.  v36 used an elapsed-cycle, panel-cadence status counter;
-     * keep that behaviour here so tight LCDCON1 polling loops observe a stable
-     * 60 Hz GP32 panel frame instead of a poll-frequency or VCLK artifact.
-     */
-    uint64_t frame_cycles = ((uint64_t)fclk + 30u) / 60u;
-    if (!frame_cycles) frame_cycles = 1u;
+static uint32_t lcd_total_lines_for_visible(uint32_t visible) {
     uint32_t vblank_lines = (visible / 16u) + 8u;
     if (vblank_lines < 8u) vblank_lines = 8u;
     uint32_t total_lines = visible + vblank_lines;
     if (total_lines <= visible) total_lines = visible + 1u;
+    return total_lines;
+}
+
+static uint64_t lcd_panel_frame_cycles(const s3c2400_t *s) {
+    uint32_t runclk = clk_run(s, MPLLCON);
+    if (!runclk) runclk = 66000000u;
+    uint64_t frame_cycles = ((uint64_t)runclk + 30u) / 60u;
+    return frame_cycles ? frame_cycles : 1u;
+}
+
+static uint32_t lcd_current_line_count(const s3c2400_t *s) {
+    if (!s) return 0u;
+    uint32_t visible = lcd_visible_lines(s);
+
+    /*
+     * LCDCON1[27:18] is consumed by BIOS code as a live LCD scan/vblank
+     * status field.  The emulator's elapsed value is in effective ARM run
+     * cycles, so convert the GP32 panel frame cadence into the same unit
+     * before deriving the current line.  This keeps polling loops tied to the
+     * emulated LCD frame rather than to host presentation phase or raw VCLK
+     * register values that commercial GP32 software does not use literally.
+     */
+    uint64_t frame_cycles = lcd_panel_frame_cycles(s);
+    uint32_t total_lines = lcd_total_lines_for_visible(visible);
     uint64_t line_cycles = frame_cycles / total_lines;
     if (!line_cycles) line_cycles = 1u;
 
@@ -1124,7 +1136,21 @@ static void dma_request_pwm(s3c2400_t *s) {
 
 void s3c2400_tick(s3c2400_t *s, uint32_t cpu_cycles) {
     if (!s || !cpu_cycles) return;
+    uint64_t old_lcd_accum = s->lcd_line_accum;
+    uint64_t lcd_frame_cycles = lcd_panel_frame_cycles(s);
     s->lcd_line_accum += (uint64_t)cpu_cycles;
+    if ((s->lcd_regs[0] & 1u) && lcd_frame_cycles &&
+        (old_lcd_accum / lcd_frame_cycles) != (s->lcd_line_accum / lcd_frame_cycles)) {
+        /*
+         * The LCD output should be a completed scanout, not a fresh full-frame
+         * decode of VRAM/palette at whatever cycle the host frontend asks for
+         * pixels.  BIOS boot effects rewrite the framebuffer and palette
+         * between vblank waits; rendering only when the emulated panel reaches
+         * the frame boundary prevents random one-line snapshots of those
+         * in-progress updates while preserving ordinary game rendering.
+         */
+        s3c2400_render_lcd(s);
+    }
     if (s->iis[0] & 1u) {
         iis_refresh_clock_cache(s);
         uint64_t period = s->iis_cached_period_cycles ? s->iis_cached_period_cycles : 1u;
@@ -1169,7 +1195,7 @@ uint32_t s3c2400_debug_read32(s3c2400_t *s, uint32_t addr) {
 
 const uint32_t *s3c2400_framebuffer(s3c2400_t *s, uint32_t *w, uint32_t *h, uint32_t *stride, uint64_t *frames) {
     if (!s) return NULL;
-    s3c2400_render_lcd(s);
+    if (s->frame_counter == 0u && (s->lcd_regs[0] & 1u)) s3c2400_render_lcd(s);
     if (w) *w = s->fb_w;
     if (h) *h = s->fb_h;
     if (stride) *stride = 240;
