@@ -873,36 +873,17 @@ void s3c2400_render_lcd(s3c2400_t *s) {
         }
     }
     /*
-     * The GP32 display is a 240x320 portrait TFT used as a 320x240
-     * landscape panel.  A raw final portrait column can sometimes expose
-     * edge/blanking garbage as the top landscape line after CCW rotation.
-     * Do not blindly duplicate column 238 into column 239, however: several
-     * legitimate intro/fade scenes intentionally draw a smooth vertical
-     * gradient at the panel edge.  Latch the final column only when it is
-     * clearly discontinuous from the preceding column across a substantial
-     * portion of the panel.  This keeps S3C2400 DMA address progression and
-     * palette decode untouched while avoiding a visible colour regression in
-     * normal edge artwork.
+     * GP32 panel aperture: the BIOS programs a 240x320 portrait DMA surface
+     * and the handheld mounts it as a 320x240 landscape panel.  The first raw
+     * DMA scanline is a panel-settle/prefetch line and is not part of the
+     * visible glass area.  The official BIOS leaves that line stale while
+     * fading the boot logo to black; exposing it after rotation produces a
+     * spurious one-pixel white line at the left edge.  Present the visible
+     * aperture by replacing that hidden raw scanline with the first displayed
+     * one.  This is a panel-timing/aperture rule, not a BIOS-title filter.
      */
     if (w == 240u && h == 320u) {
-        uint32_t large_delta = 0u;
-        uint32_t total_delta = 0u;
-        for (uint32_t yy = 0; yy < h; ++yy) {
-            uint32_t a = s->fb[yy * 240u + 239u];
-            uint32_t b = s->fb[yy * 240u + 238u];
-            uint32_t ar = (a >> 16) & 0xffu, ag = (a >> 8) & 0xffu, ab = a & 0xffu;
-            uint32_t br = (b >> 16) & 0xffu, bg = (b >> 8) & 0xffu, bb = b & 0xffu;
-            uint32_t d = (ar > br ? ar - br : br - ar) +
-                         (ag > bg ? ag - bg : bg - ag) +
-                         (ab > bb ? ab - bb : bb - ab);
-            total_delta += d;
-            if (d > 50u) large_delta++;
-        }
-        if (large_delta >= 64u && total_delta >= 6400u) {
-            for (uint32_t yy = 0; yy < h; ++yy) {
-                s->fb[yy * 240u + 239u] = s->fb[yy * 240u + 238u];
-            }
-        }
+        memcpy(&s->fb[0], &s->fb[240u], 240u * sizeof(s->fb[0]));
     }
     s->fb_w = w; s->fb_h = h; s->frame_counter++;
 }
