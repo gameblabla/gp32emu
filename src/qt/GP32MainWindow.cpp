@@ -561,6 +561,13 @@ void GP32MainWindow::updateStatus(const QString &status) { m_status->setText(sta
 
 uint32_t GP32MainWindow::keyMappedButton(int key) const {
     for (int i = 0; i < kInputCount; ++i) if (m_keyBindings.value(i) == key) return kInputDefs[i].mask;
+
+    /* Stable convenience aliases for arcade-style homebrew: AKA NOID requires
+       a coin/select press followed by start.  Keep these aliases independent of
+       the configurable primary bindings so old user settings cannot make the
+       default title-screen controls appear dead. */
+    if (key == Qt::Key_Space) return GP32_BUTTON_START;
+    if (key == Qt::Key_C) return GP32_BUTTON_SELECT;
     return 0u;
 }
 

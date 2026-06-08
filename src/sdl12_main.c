@@ -46,7 +46,7 @@ static void usage(const char *argv0) {
         "usage: %s [--bios gp32166m.bin] [--smc game.smc] [--fxe homebrew.fxe|--fpk package.fpk] [--input-script script.txt] [--record-input out.script] [--state file.gp32st] [--max-frames N] [--scale N] [--fullscreen] [--lcd-persistence] [--frame-interpolation] [--cycles-per-frame N] [--audio-rate HZ] [--hle-sef-rate HZ] [--no-audio] [--joystick|--no-joystick] [--joystick-axis|--no-joystick-axis] [--trace] [--jit|--no-jit] [--jit-stats] [--rotate-ccw|--rotate-cw|--rotate-180|--no-rotate]\n"
         "\n"
         "SDL 1.2 interactive GP32 frontend. Headless builds do not depend on SDL.\n"
-        "Keyboard: arrows=dpad, z=A, x=B, a=L, s=R, Enter=Start, Shift=Select, Esc=quit. Hotkeys: F5=save state, F8=load state. Input scripts use FRAMEf:BUTTON names such as 1550f:P.\n",
+        "Keyboard: arrows=dpad, z=A, x=B, a=L, s=R, Enter/Space=Start, Shift/C=Select, Esc=quit. Hotkeys: F5=save state, F8=load state. Input scripts use FRAMEf:BUTTON names such as 1550f:P.\n",
         argv0);
 }
 

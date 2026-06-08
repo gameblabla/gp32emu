@@ -16,6 +16,7 @@ arm_bus_t s3c2400_get_bus(s3c2400_t *soc);
 
 int s3c2400_load_bios(s3c2400_t *soc, const char *path, char *err, size_t err_len);
 int s3c2400_load_bios_buffer(s3c2400_t *soc, const uint8_t *data, size_t size, char *err, size_t err_len);
+void s3c2400_install_hle_bios(s3c2400_t *soc);
 int s3c2400_load_smartmedia(s3c2400_t *soc, const char *path, char *err, size_t err_len);
 int s3c2400_load_smartmedia_buffer(s3c2400_t *soc, const uint8_t *data, size_t size, char *err, size_t err_len);
 int s3c2400_save_smartmedia(s3c2400_t *soc, const char *path, char *err, size_t err_len);

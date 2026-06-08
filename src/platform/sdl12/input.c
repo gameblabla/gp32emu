@@ -31,8 +31,8 @@ static void add_key_buttons(uint8_t *keys, uint32_t *mask) {
     if (keys[SDLK_x])      *mask |= GP32_BUTTON_B;
     if (keys[SDLK_a])      *mask |= GP32_BUTTON_L;
     if (keys[SDLK_s])      *mask |= GP32_BUTTON_R;
-    if (keys[SDLK_RETURN]) *mask |= GP32_BUTTON_START;
-    if (keys[SDLK_RSHIFT] || keys[SDLK_LSHIFT]) *mask |= GP32_BUTTON_SELECT;
+    if (keys[SDLK_RETURN] || keys[SDLK_SPACE]) *mask |= GP32_BUTTON_START;
+    if (keys[SDLK_RSHIFT] || keys[SDLK_LSHIFT] || keys[SDLK_c]) *mask |= GP32_BUTTON_SELECT;
 }
 
 static int joy_button(const sdl12_input_backend_t *in, int index) {

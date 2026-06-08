@@ -241,6 +241,15 @@ int s3c2400_load_bios_buffer(s3c2400_t *s, const uint8_t *data, size_t size, cha
     memcpy(s->bios, data, size);
     return 1;
 }
+void s3c2400_install_hle_bios(s3c2400_t *s) {
+    if (!s) return;
+    /* Direct-loaded FXE/GXB homebrew runs without the retail ROM, but legacy
+       GPSDK/GPOS code still probes low firmware space.  An erased 0xff ROM
+       turns null/firmware-probe reads into bogus callable addresses; the HLE
+       firmware image uses zero-filled vectors/data so absent callbacks read as
+       NULL while real BIOS boot remains controlled by s3c2400_load_bios(). */
+    memset(s->bios, 0x00, BIOS_SIZE);
+}
 int s3c2400_load_smartmedia(s3c2400_t *s, const char *path, char *err, size_t err_len) { return s && smc_load_file(s->smc, path, err, err_len); }
 int s3c2400_load_smartmedia_buffer(s3c2400_t *s, const uint8_t *data, size_t size, char *err, size_t err_len) { return s && smc_load_buffer(s->smc, data, size, err, err_len); }
 int s3c2400_save_smartmedia(s3c2400_t *s, const char *path, char *err, size_t err_len) { return s && smc_save_file(s->smc, path, err, err_len); }

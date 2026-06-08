@@ -10,6 +10,8 @@
 #define ARM_MODE_SVC 0x13u
 #define ARM_I_FLAG 0x00000080u
 #define ARM_F_FLAG 0x00000040u
+#define GP32_DIRECT_GPOS_TIMER_COUNT 4u
+#define GP32_DIRECT_PCM_CHANNELS 4u
 
 struct gp32 {
     s3c2400_t *soc;
@@ -32,6 +34,10 @@ struct gp32 {
     char direct_fxe_title[33];
     char direct_smc_executable_path[260];
     char direct_smc_game_dir[260];
+    fxe_image_t direct_reset_image;
+    uint32_t direct_reset_image_valid;
+    uint32_t direct_reset_scan_file_hle;
+    uint32_t direct_reset_init_smc_gpio;
     fpk_asset_t *direct_fpk_assets;
     size_t direct_fpk_asset_count;
     struct {
@@ -68,6 +74,17 @@ struct gp32 {
     uint32_t direct_hle_pcm_pos_bytes;
     uint32_t direct_hle_pcm_repeat;
     uint64_t direct_hle_pcm_accum;
+    struct {
+        uint32_t active;
+        uint32_t src_addr;
+        uint32_t size_bytes;
+        uint32_t pos_bytes;
+        uint32_t repeat;
+        uint32_t rate;
+        uint32_t stereo;
+        uint32_t bits;
+        uint64_t accum;
+    } direct_hle_pcm_ch[GP32_DIRECT_PCM_CHANNELS];
     uint32_t direct_hle_sdk_sndmixedbuf_addr;
     uint32_t direct_hle_sdk_sndsrcexist_addr;
     uint32_t direct_hle_sdk_pcm_workidx_addr;
@@ -81,6 +98,18 @@ struct gp32 {
     uint64_t direct_hle_sdk_timer_accum;
     uint32_t direct_hle_sdk_submitted_frames;
     uint32_t direct_hle_sdk_timer_table_addr;
+    struct {
+        uint32_t configured;
+        uint32_t enabled;
+        uint32_t callback;
+        uint32_t tps;
+        uint32_t max_exec_tick;
+        uint64_t accum;
+    } direct_hle_gpos_timer[GP32_DIRECT_GPOS_TIMER_COUNT];
+    uint32_t direct_hle_gpos_timers_enabled;
+    uint32_t direct_hle_gpos_task_first;
+    uint32_t direct_hle_gpos_task_last;
+    uint32_t direct_hle_gpos_scheduler_callback;
     uint32_t direct_hle_callback_returned;
     uint32_t direct_hle_callback_running;
     uint32_t direct_hle_audio_rate_override;
@@ -125,8 +154,17 @@ static void direct_write_fw_arg(gp32_t *g, uint32_t addr, uint32_t value) {
     if ((addr & 3u) == 0u) direct_write32_if_ram(g, addr, value);
     else direct_write8_if_ram(g, addr, (uint8_t)value);
 }
+static uint32_t direct_hle_work_base(const gp32_t *g) {
+    uint32_t ram_size = (g && g->soc) ? (uint32_t)s3c2400_ram_size(g->soc) : 0u;
+    /* Keep direct-FXE firmware work memory out of the application stack.
+       GPSDK scheduler stacks commonly live at the top of RAM; aliasing the
+       firmware HLE stubs there can corrupt saved task contexts. */
+    if (ram_size >= 0x00800000u) return GP32_RAM_BASE + 0x007d0000u;
+    if (ram_size >= 0x00400000u) return GP32_RAM_BASE + ram_size - 0x30000u;
+    return GP32_RAM_BASE + 0x100u;
+}
 static uint32_t direct_stub_addr(const gp32_t *g) {
-    return g->direct_fxe_stack >= GP32_RAM_BASE + 0x2000u ? g->direct_fxe_stack - 0x2000u : GP32_RAM_BASE + 0x100u;
+    return direct_hle_work_base(g);
 }
 static uint32_t direct_ret_stub_addr(const gp32_t *g) { return direct_stub_addr(g) + 16u; }
 static uint32_t direct_callback_return_stub_addr(const gp32_t *g) { return direct_stub_addr(g) + 24u; }
@@ -195,7 +233,7 @@ static void direct_install_smc_callbacks(gp32_t *g) {
 }
 
 static uint32_t direct_fwinfo_addr(const gp32_t *g) {
-    return g->direct_fxe_stack >= GP32_RAM_BASE + 0x1000u ? g->direct_fxe_stack - 0x1000u : GP32_RAM_BASE;
+    return direct_hle_work_base(g) + 0x10000u;
 }
 
 static uint32_t direct_fw_tick_addr(const gp32_t *g) {
@@ -208,6 +246,12 @@ static uint32_t direct_pcm_cursor_addr(const gp32_t *g) {
 
 static void direct_update_fw_tick(gp32_t *g);
 static void direct_hle_audio_tick(gp32_t *g, uint32_t cycles);
+static void direct_hle_gpos_timer_tick(gp32_t *g, uint32_t cycles);
+static gp32_status_t gp32_load_fxe_image_internal(gp32_t *g, fxe_image_t *img, int update_reset_image, int scan_file_hle, int init_smc_gpio, int preserve_hle_options);
+static int direct_handle_swi_gpos_timer(gp32_t *g, arm920t_t *cpu, uint32_t pc);
+static void direct_tick_sdk_task_sleepers(gp32_t *g, uint32_t first_task, uint32_t last_task);
+static int direct_resume_ready_sdk_task(gp32_t *g, uint32_t pc, uint32_t first_task, uint32_t last_task);
+static int direct_task_record_plausible(gp32_t *g, uint32_t task_addr);
 
 static uint32_t direct_firmware_clock_hz(const gp32_t *g) {
     uint32_t hz = 0u;
@@ -679,12 +723,9 @@ static void direct_set_lcd_8bpp(gp32_t *g, uint32_t fb_addr, uint32_t pal_addr) 
 }
 
 
-static void direct_clear_fpk_assets(gp32_t *g) {
+static void direct_reset_hle_runtime(gp32_t *g, int preserve_hle_options) {
     if (!g) return;
-    for (size_t i = 0; i < g->direct_fpk_asset_count; ++i) free(g->direct_fpk_assets[i].data);
-    free(g->direct_fpk_assets);
-    g->direct_fpk_assets = NULL;
-    g->direct_fpk_asset_count = 0;
+    uint32_t saved_rate_override = preserve_hle_options ? g->direct_hle_audio_rate_override : 0u;
     memset(g->direct_fpk_handles, 0, sizeof(g->direct_fpk_handles));
     g->direct_hle_file_open_addr = 0;
     g->direct_hle_file_read_addr[0] = 0;
@@ -716,6 +757,7 @@ static void direct_clear_fpk_assets(gp32_t *g) {
     g->direct_hle_pcm_pos_bytes = 0;
     g->direct_hle_pcm_repeat = 0;
     g->direct_hle_pcm_accum = 0;
+    memset(g->direct_hle_pcm_ch, 0, sizeof(g->direct_hle_pcm_ch));
     g->direct_hle_sdk_sndmixedbuf_addr = 0;
     g->direct_hle_sdk_sndsrcexist_addr = 0;
     g->direct_hle_sdk_pcm_workidx_addr = 0;
@@ -729,9 +771,14 @@ static void direct_clear_fpk_assets(gp32_t *g) {
     g->direct_hle_sdk_timer_accum = 0;
     g->direct_hle_sdk_submitted_frames = 0;
     g->direct_hle_sdk_timer_table_addr = 0;
+    memset(g->direct_hle_gpos_timer, 0, sizeof(g->direct_hle_gpos_timer));
+    g->direct_hle_gpos_timers_enabled = 0;
+    g->direct_hle_gpos_task_first = 0;
+    g->direct_hle_gpos_task_last = 0;
+    g->direct_hle_gpos_scheduler_callback = 0;
     g->direct_hle_callback_returned = 0;
     g->direct_hle_callback_running = 0;
-    g->direct_hle_audio_rate_override = 0;
+    g->direct_hle_audio_rate_override = saved_rate_override;
     g->direct_hle_audio_last_auto_rate = 0;
     g->direct_hle_audio_asset = NULL;
     g->direct_hle_audio_pos = 0;
@@ -739,6 +786,38 @@ static void direct_clear_fpk_assets(gp32_t *g) {
     g->direct_hle_audio_rate = 0;
     g->direct_hle_audio_accum = 0;
     memset(g->direct_hle_asset_autoload, 0, sizeof(g->direct_hle_asset_autoload));
+}
+
+static void direct_clear_reset_image(gp32_t *g) {
+    if (!g) return;
+    free(g->direct_reset_image.payload);
+    memset(&g->direct_reset_image, 0, sizeof(g->direct_reset_image));
+    g->direct_reset_image_valid = 0;
+    g->direct_reset_scan_file_hle = 0;
+    g->direct_reset_init_smc_gpio = 0;
+}
+
+static int direct_store_reset_image(gp32_t *g, const fxe_image_t *img, int scan_file_hle, int init_smc_gpio) {
+    if (!g || !img || !img->payload || !img->payload_size) return 0;
+    uint8_t *copy = (uint8_t *)malloc(img->payload_size);
+    if (!copy) return 0;
+    memcpy(copy, img->payload, img->payload_size);
+    direct_clear_reset_image(g);
+    g->direct_reset_image = *img;
+    g->direct_reset_image.payload = copy;
+    g->direct_reset_image_valid = 1u;
+    g->direct_reset_scan_file_hle = scan_file_hle ? 1u : 0u;
+    g->direct_reset_init_smc_gpio = init_smc_gpio ? 1u : 0u;
+    return 1;
+}
+
+static void direct_clear_fpk_assets(gp32_t *g) {
+    if (!g) return;
+    for (size_t i = 0; i < g->direct_fpk_asset_count; ++i) free(g->direct_fpk_assets[i].data);
+    free(g->direct_fpk_assets);
+    g->direct_fpk_assets = NULL;
+    g->direct_fpk_asset_count = 0;
+    direct_reset_hle_runtime(g, 0);
 }
 
 static int direct_read_cstr(gp32_t *g, uint32_t addr, char *out, size_t out_len) {
@@ -994,22 +1073,18 @@ static uint32_t direct_hle_sef_playback_rate(gp32_t *g) {
     if (!g) return 22050u;
     if (g->direct_hle_audio_rate_override >= 4000u && g->direct_hle_audio_rate_override <= 192000u) return g->direct_hle_audio_rate_override;
 
-    /* A SEF resource only carries "sef " + payload length + raw unsigned 8-bit
-       mono PCM bytes.  The source rate is supplied by the SDK sound engine.  In
-       OMG's direct-load engine the value stored at +0x54 is a timer period in
-       milliseconds, not a frequency in Hz.  v29 treated it as 50 Hz and
-       multiplied it by the fixed-point quantum at +0x10, producing a 12.8 kHz
-       source rate and a noticeably low-pitched voice.  Use the engine's ring
-       buffer size and timer period to estimate byte throughput, then snap that
-       to a normal GP32/PCM rate.  For OMG this gives 1024 bytes per 50 ms,
-       which is nearest to 22050 Hz. */
+    /* GPSDK's stream helper feeds SEF data through GpPcmPlay() as raw unsigned
+       8-bit mono PCM.  The SEF header only carries "sef " + payload length;
+       the playback rate comes from the SDK stream ring-buffer byte rate.
+       OMG reads 1024 bytes every 50 ms, i.e. 20480 8-bit samples/s, which
+       snaps to the GP32's 22050 Hz PCM mode. */
     if (g->soc && g->direct_hle_sound_state_addr && direct_ram_range(g, g->direct_hle_sound_state_addr, 0x58u)) {
         uint32_t ring_bytes = s3c2400_debug_read32(g->soc, g->direct_hle_sound_state_addr + 0x14u);
         uint32_t period_ms = s3c2400_debug_read32(g->soc, g->direct_hle_sound_state_addr + 0x54u);
         if (ring_bytes >= 128u && ring_bytes <= 65536u && period_ms >= 1u && period_ms <= 1000u) {
-            uint64_t raw = ((uint64_t)ring_bytes * 1000u + (uint64_t)period_ms / 2u) / (uint64_t)period_ms;
-            if (raw >= 4000u && raw <= 96000u) {
-                uint32_t rate = direct_nearest_standard_audio_rate((uint32_t)raw);
+            uint64_t samples_per_sec = ((uint64_t)ring_bytes * 1000u + (uint64_t)period_ms / 2u) / (uint64_t)period_ms;
+            if (samples_per_sec >= 4000u && samples_per_sec <= 96000u) {
+                uint32_t rate = direct_nearest_standard_audio_rate((uint32_t)samples_per_sec);
                 g->direct_hle_audio_last_auto_rate = rate;
                 return rate;
             }
@@ -1181,71 +1256,206 @@ static uint32_t direct_pcm_stereo_from_sr(uint32_t sr) {
     return (sr == 1u || sr == 3u || sr == 5u) ? 1u : 0u;
 }
 
+static uint32_t direct_pcm_cursor_addr_channel(const gp32_t *g, uint32_t ch) {
+    return direct_pcm_cursor_addr(g) + ch * 4u;
+}
+
+static void direct_pcm_sync_legacy(gp32_t *g) {
+    if (!g) return;
+    uint32_t first = GP32_DIRECT_PCM_CHANNELS;
+    for (uint32_t ch = 0; ch < GP32_DIRECT_PCM_CHANNELS; ++ch) {
+        if (g->direct_hle_pcm_ch[ch].active) { first = ch; break; }
+    }
+    if (first < GP32_DIRECT_PCM_CHANNELS) {
+        g->direct_hle_pcm_active = 1u;
+        g->direct_hle_pcm_src_addr = g->direct_hle_pcm_ch[first].src_addr;
+        g->direct_hle_pcm_size_bytes = g->direct_hle_pcm_ch[first].size_bytes;
+        g->direct_hle_pcm_pos_bytes = g->direct_hle_pcm_ch[first].pos_bytes;
+        g->direct_hle_pcm_repeat = g->direct_hle_pcm_ch[first].repeat;
+    } else {
+        g->direct_hle_pcm_active = 0u;
+        g->direct_hle_pcm_src_addr = 0u;
+        g->direct_hle_pcm_size_bytes = 0u;
+        g->direct_hle_pcm_pos_bytes = 0u;
+        g->direct_hle_pcm_repeat = 0u;
+    }
+}
+
 static void direct_pcm_update_cursor(gp32_t *g) {
     if (!g) return;
-    uint32_t cursor = g->direct_hle_pcm_active ? (g->direct_hle_pcm_src_addr + g->direct_hle_pcm_pos_bytes) : 0u;
-    direct_write32_if_ram(g, direct_pcm_cursor_addr(g), cursor);
+    for (uint32_t ch = 0; ch < GP32_DIRECT_PCM_CHANNELS; ++ch) {
+        uint32_t cursor = g->direct_hle_pcm_ch[ch].active ?
+            (g->direct_hle_pcm_ch[ch].src_addr + g->direct_hle_pcm_ch[ch].pos_bytes) : 0u;
+        direct_write32_if_ram(g, direct_pcm_cursor_addr_channel(g, ch), cursor);
+    }
+    direct_pcm_sync_legacy(g);
+}
+
+static void direct_stop_pcm_channel(gp32_t *g, uint32_t ch) {
+    if (!g || ch >= GP32_DIRECT_PCM_CHANNELS) return;
+    memset(&g->direct_hle_pcm_ch[ch], 0, sizeof(g->direct_hle_pcm_ch[ch]));
+    direct_write32_if_ram(g, direct_pcm_cursor_addr_channel(g, ch), 0u);
+    direct_pcm_sync_legacy(g);
 }
 
 static void direct_stop_pcm(gp32_t *g) {
     if (!g) return;
-    g->direct_hle_pcm_active = 0;
-    g->direct_hle_pcm_src_addr = 0;
-    g->direct_hle_pcm_size_bytes = 0;
-    g->direct_hle_pcm_pos_bytes = 0;
-    g->direct_hle_pcm_repeat = 0;
+    for (uint32_t ch = 0; ch < GP32_DIRECT_PCM_CHANNELS; ++ch) direct_stop_pcm_channel(g, ch);
     g->direct_hle_pcm_accum = 0;
     direct_pcm_update_cursor(g);
 }
 
-static int direct_start_pcm(gp32_t *g, uint32_t src_addr, uint32_t size_bytes, uint32_t repeat) {
+static void direct_stop_pcm_src(gp32_t *g, uint32_t src_addr) {
+    if (!g) return;
+    if (!src_addr) { direct_stop_pcm(g); return; }
+    for (uint32_t ch = 0; ch < GP32_DIRECT_PCM_CHANNELS; ++ch) {
+        if (g->direct_hle_pcm_ch[ch].active && g->direct_hle_pcm_ch[ch].src_addr == src_addr) {
+            direct_stop_pcm_channel(g, ch);
+        }
+    }
+    direct_pcm_update_cursor(g);
+}
+
+static int direct_start_pcm(gp32_t *g, uint32_t src_addr, uint32_t size_bytes, uint32_t repeat, uint32_t *out_ch) {
+    if (out_ch) *out_ch = 0xffffffffu;
     if (!g || !g->soc || !src_addr || size_bytes < 1u || !direct_ram_range(g, src_addr, size_bytes)) return 0;
     if (!g->direct_hle_pcm_rate) g->direct_hle_pcm_rate = direct_pcm_rate_from_sr(g->direct_hle_pcm_sr);
     if (!g->direct_hle_pcm_bits) g->direct_hle_pcm_bits = 16u;
-    g->direct_hle_pcm_active = 1u;
-    g->direct_hle_pcm_src_addr = src_addr;
-    g->direct_hle_pcm_size_bytes = size_bytes;
-    g->direct_hle_pcm_pos_bytes = 0;
-    g->direct_hle_pcm_repeat = repeat ? 1u : 0u;
-    g->direct_hle_pcm_accum = 0;
-    direct_pcm_update_cursor(g);
+
+    uint32_t ch = GP32_DIRECT_PCM_CHANNELS;
+    for (uint32_t i = 0; i < GP32_DIRECT_PCM_CHANNELS; ++i) {
+        if (g->direct_hle_pcm_ch[i].active && g->direct_hle_pcm_ch[i].src_addr == src_addr) { ch = i; break; }
+    }
+    if (ch == GP32_DIRECT_PCM_CHANNELS) {
+        for (uint32_t i = 0; i < GP32_DIRECT_PCM_CHANNELS; ++i) {
+            if (!g->direct_hle_pcm_ch[i].active) { ch = i; break; }
+        }
+    }
+    if (ch == GP32_DIRECT_PCM_CHANNELS) return 0;
+
+    g->direct_hle_pcm_ch[ch].active = 1u;
+    g->direct_hle_pcm_ch[ch].src_addr = src_addr;
+    g->direct_hle_pcm_ch[ch].size_bytes = size_bytes;
+    g->direct_hle_pcm_ch[ch].pos_bytes = 0u;
+    g->direct_hle_pcm_ch[ch].repeat = repeat ? 1u : 0u;
+    g->direct_hle_pcm_ch[ch].rate = g->direct_hle_pcm_rate ? g->direct_hle_pcm_rate : direct_pcm_rate_from_sr(g->direct_hle_pcm_sr);
+    g->direct_hle_pcm_ch[ch].stereo = g->direct_hle_pcm_stereo;
+    g->direct_hle_pcm_ch[ch].bits = g->direct_hle_pcm_bits ? g->direct_hle_pcm_bits : 16u;
+    g->direct_hle_pcm_ch[ch].accum = 0u;
+    direct_write32_if_ram(g, direct_pcm_cursor_addr_channel(g, ch), src_addr);
+    direct_pcm_sync_legacy(g);
+    if (out_ch) *out_ch = ch;
     return 1;
 }
 
+static uint32_t direct_pcm_channel_frame_bytes(const gp32_t *g, uint32_t ch) {
+    if (!g || ch >= GP32_DIRECT_PCM_CHANNELS) return 0u;
+    uint32_t b = (g->direct_hle_pcm_ch[ch].bits == 8u) ? 1u : 2u;
+    if (g->direct_hle_pcm_ch[ch].stereo) b *= 2u;
+    return b;
+}
+
+static int direct_pcm_channel_sample(gp32_t *g, uint32_t ch, uint32_t out_rate, int32_t *left, int32_t *right) {
+    if (!g || ch >= GP32_DIRECT_PCM_CHANNELS || !left || !right) return 0;
+    if (!g->direct_hle_pcm_ch[ch].active) return 0;
+    uint32_t frame_bytes = direct_pcm_channel_frame_bytes(g, ch);
+    if (!frame_bytes || g->direct_hle_pcm_ch[ch].size_bytes < frame_bytes) { direct_stop_pcm_channel(g, ch); return 0; }
+    if (g->direct_hle_pcm_ch[ch].pos_bytes + frame_bytes > g->direct_hle_pcm_ch[ch].size_bytes) {
+        if (g->direct_hle_pcm_ch[ch].repeat) g->direct_hle_pcm_ch[ch].pos_bytes = 0u;
+        else { direct_stop_pcm_channel(g, ch); return 0; }
+    }
+
+    uint32_t addr = g->direct_hle_pcm_ch[ch].src_addr + g->direct_hle_pcm_ch[ch].pos_bytes;
+    int16_t l = 0, r = 0;
+    if (g->direct_hle_pcm_ch[ch].bits == 8u) {
+        l = (int16_t)(((int)direct_read8_if_ram(g, addr) - 128) << 8);
+        if (g->direct_hle_pcm_ch[ch].stereo) r = (int16_t)(((int)direct_read8_if_ram(g, addr + 1u) - 128) << 8);
+        else r = l;
+    } else {
+        l = (int16_t)((int32_t)direct_read_u16_if_ram(g, addr) - 32768);
+        if (g->direct_hle_pcm_ch[ch].stereo) r = (int16_t)((int32_t)direct_read_u16_if_ram(g, addr + 2u) - 32768);
+        else r = l;
+    }
+    *left += l;
+    *right += r;
+
+    uint32_t rate = g->direct_hle_pcm_ch[ch].rate ? g->direct_hle_pcm_ch[ch].rate : 11025u;
+    g->direct_hle_pcm_ch[ch].accum += (uint64_t)rate;
+    uint32_t adv = (uint32_t)(g->direct_hle_pcm_ch[ch].accum / (uint64_t)out_rate);
+    g->direct_hle_pcm_ch[ch].accum %= (uint64_t)out_rate;
+    if (!adv) return 1;
+    uint64_t new_pos = (uint64_t)g->direct_hle_pcm_ch[ch].pos_bytes + (uint64_t)adv * (uint64_t)frame_bytes;
+    if (new_pos >= g->direct_hle_pcm_ch[ch].size_bytes) {
+        if (g->direct_hle_pcm_ch[ch].repeat) new_pos %= g->direct_hle_pcm_ch[ch].size_bytes;
+        else { direct_stop_pcm_channel(g, ch); return 1; }
+    }
+    g->direct_hle_pcm_ch[ch].pos_bytes = (uint32_t)new_pos;
+    direct_write32_if_ram(g, direct_pcm_cursor_addr_channel(g, ch), g->direct_hle_pcm_ch[ch].src_addr + g->direct_hle_pcm_ch[ch].pos_bytes);
+    direct_pcm_sync_legacy(g);
+    return 1;
+}
+
+static int direct_hle_pcm_any_active(gp32_t *g) {
+    if (!g) return 0;
+    for (uint32_t ch = 0; ch < GP32_DIRECT_PCM_CHANNELS; ++ch) if (g->direct_hle_pcm_ch[ch].active) return 1;
+    return 0;
+}
+
+static int direct_hle_sef_sample(gp32_t *g, uint32_t out_rate, int32_t *left, int32_t *right) {
+    if (!g || !left || !right || !g->direct_hle_audio_asset || !g->direct_hle_audio_rate) return 0;
+    if (g->direct_hle_audio_pos >= g->direct_hle_audio_size) { direct_stop_sef(g); return 0; }
+    uint32_t off = 8u + g->direct_hle_audio_pos;
+    const uint8_t *d = g->direct_hle_audio_asset->data;
+    int16_t s = (int16_t)(((int)d[off] - 128) << 8);
+    *left += s;
+    *right += s;
+
+    uint32_t rate = g->direct_hle_audio_rate ? g->direct_hle_audio_rate : 11025u;
+    g->direct_hle_audio_accum += (uint64_t)rate;
+    uint32_t adv = (uint32_t)(g->direct_hle_audio_accum / (uint64_t)out_rate);
+    g->direct_hle_audio_accum %= (uint64_t)out_rate;
+    if (adv) {
+        uint64_t new_pos = (uint64_t)g->direct_hle_audio_pos + (uint64_t)adv;
+        if (new_pos >= g->direct_hle_audio_size) direct_stop_sef(g);
+        else g->direct_hle_audio_pos = (uint32_t)new_pos;
+    }
+    return 1;
+}
+
+static int16_t direct_mix_clamp_i16(int32_t v) {
+    if (v > 32767) return 32767;
+    if (v < -32768) return -32768;
+    return (int16_t)v;
+}
+
+static uint32_t direct_hle_mix_output_rate(gp32_t *g) {
+    /* Keep the direct-HLE mixer at one output rate for the whole generated
+       stream.  Individual GPSDK PCM sources can be 11/22/44 kHz and the SEF
+       stream path is normally 22 kHz; switching the emulator's appended sample
+       rate while a WAV/frontend buffer is already open makes earlier samples
+       play at the wrong speed.  Mix every HLE stream into 44.1 kHz and resample
+       each active source into that domain. */
+    GP32_UNUSED(g);
+    return 44100u;
+}
+
 static void direct_hle_pcm_tick(gp32_t *g, uint32_t cycles) {
-    if (!g || !g->soc || !g->direct_hle_pcm_active || !cycles) return;
-    uint32_t frame_bytes = (g->direct_hle_pcm_bits == 8u) ? 1u : 2u;
-    if (g->direct_hle_pcm_stereo) frame_bytes *= 2u;
-    if (!frame_bytes || g->direct_hle_pcm_size_bytes < frame_bytes) { direct_stop_pcm(g); return; }
+    if (!g || !g->soc || !cycles) return;
+    if (!g->direct_hle_audio_asset && !direct_hle_pcm_any_active(g)) return;
+    uint32_t out_rate = direct_hle_mix_output_rate(g);
     uint32_t clock = direct_firmware_clock_hz(g);
-    uint32_t rate = g->direct_hle_pcm_rate ? g->direct_hle_pcm_rate : direct_pcm_rate_from_sr(g->direct_hle_pcm_sr);
-    uint64_t scaled = g->direct_hle_pcm_accum + (uint64_t)cycles * (uint64_t)rate;
+    uint64_t scaled = g->direct_hle_pcm_accum + (uint64_t)cycles * (uint64_t)out_rate;
     uint32_t frames = (uint32_t)(scaled / (uint64_t)clock);
     g->direct_hle_pcm_accum = scaled % (uint64_t)clock;
     if (!frames) return;
     for (uint32_t i = 0; i < frames; ++i) {
-        if (g->direct_hle_pcm_pos_bytes + frame_bytes > g->direct_hle_pcm_size_bytes) {
-            if (g->direct_hle_pcm_repeat) g->direct_hle_pcm_pos_bytes = 0u;
-            else { direct_stop_pcm(g); break; }
+        int32_t left = 0, right = 0;
+        int active = 0;
+        if (direct_hle_sef_sample(g, out_rate, &left, &right)) active = 1;
+        for (uint32_t ch = 0; ch < GP32_DIRECT_PCM_CHANNELS; ++ch) {
+            if (direct_pcm_channel_sample(g, ch, out_rate, &left, &right)) active = 1;
         }
-        uint32_t addr = g->direct_hle_pcm_src_addr + g->direct_hle_pcm_pos_bytes;
-        int16_t left = 0, right = 0;
-        if (g->direct_hle_pcm_bits == 8u) {
-            left = (int16_t)(((int)direct_read8_if_ram(g, addr) - 128) << 8);
-            if (g->direct_hle_pcm_stereo) right = (int16_t)(((int)direct_read8_if_ram(g, addr + 1u) - 128) << 8);
-            else right = left;
-        } else {
-            /* GPSDK/GpPcm 16-bit streams use the same unsigned-center convention
-               as 8-bit PCM: 0x8000 is silence.  Treating those halfwords as
-               signed PCM makes silence become -32768 and turns commercial
-               PCM streams into full-scale distorted audio. */
-            left = (int16_t)((int32_t)direct_read_u16_if_ram(g, addr) - 32768);
-            if (g->direct_hle_pcm_stereo) right = (int16_t)((int32_t)direct_read_u16_if_ram(g, addr + 2u) - 32768);
-            else right = left;
-        }
-        s3c2400_audio_append_s16_stereo(g->soc, left, right, rate);
-        g->direct_hle_pcm_pos_bytes += frame_bytes;
-        if (g->direct_hle_pcm_pos_bytes >= g->direct_hle_pcm_size_bytes && g->direct_hle_pcm_repeat) g->direct_hle_pcm_pos_bytes = 0u;
+        if (active) s3c2400_audio_append_s16_stereo(g->soc, direct_mix_clamp_i16(left), direct_mix_clamp_i16(right), out_rate);
     }
     direct_pcm_update_cursor(g);
 }
@@ -1431,17 +1641,224 @@ static int direct_call_guest_callback(gp32_t *g, uint32_t callback) {
 }
 
 static void direct_sdk_poll_timers(gp32_t *g) {
-    uint32_t table = direct_find_sdk_timer_table(g);
-    if (!table) return;
-    for (uint32_t slot = 0; slot < 4u; ++slot) {
-        uint32_t e = table + slot * 16u;
-        uint32_t on = direct_read32_if_ram(g, e + 0u);
-        uint32_t interval = direct_read32_if_ram(g, e + 8u);
-        uint32_t cb = direct_read32_if_ram(g, e + 12u);
-        if (on == 1u && interval && direct_ram_range(g, cb & ~1u, 4u)) direct_call_guest_callback(g, cb);
+    if (g && g->direct_hle_sdk_sndmixer_addr) (void)direct_find_sdk_timer_table(g);
+    /* Direct-FXE HLE must not re-enter arbitrary SDK timer callbacks from
+       the host audio tick.  These callbacks are IRQ-context firmware code and
+       can run while the foreground task owns an APCS stack frame; running them
+       as normal guest calls corrupts homebrew such as AKA NOID when it reaches
+       menu/gameplay code.  GPOS timer state is handled by
+       direct_hle_gpos_timer_tick(), and PCM refill callbacks are dispatched
+       separately on the private HLE callback stack. */
+}
+
+
+
+
+static void direct_gpos_timer_reset(gp32_t *g) {
+    if (!g) return;
+    memset(g->direct_hle_gpos_timer, 0, sizeof(g->direct_hle_gpos_timer));
+    g->direct_hle_gpos_timers_enabled = 0u;
+    g->direct_hle_gpos_task_first = 0u;
+    g->direct_hle_gpos_task_last = 0u;
+    g->direct_hle_gpos_scheduler_callback = 0u;
+}
+
+static int direct_gpos_task_table_bounds_valid(gp32_t *g, uint32_t first, uint32_t last_after) {
+    if (!g || last_after < 0x34u) return 0;
+    if (last_after <= first || last_after - first > 16u * 0x34u) return 0;
+    if (((last_after - first) % 0x34u) != 0u) return 0;
+    if (!direct_ram_range(g, first, 0x34u) || !direct_ram_range(g, last_after - 0x34u, 0x34u)) return 0;
+    return direct_task_record_plausible(g, first) && direct_task_record_plausible(g, last_after - 0x34u);
+}
+
+static void direct_gpos_neutralize_internal_timer_tasks(gp32_t *g) {
+    if (!g || !g->direct_hle_gpos_task_first || !g->direct_hle_gpos_task_last || !g->direct_hle_gpos_scheduler_callback) return;
+    uint32_t cb = g->direct_hle_gpos_scheduler_callback & ~1u;
+    uint32_t lo = cb + 0x280u;
+    uint32_t hi = cb + 0x330u;
+    for (uint32_t t = g->direct_hle_gpos_task_first; t <= g->direct_hle_gpos_task_last; t += 0x34u) {
+        if (!direct_task_record_plausible(g, t)) continue;
+        uint32_t entry = s3c2400_debug_read32(g->soc, t + 0x30u) & ~1u;
+        if (entry >= lo && entry < hi) {
+            /* The resident GPOS timer-process threads are entered from the
+               firmware timer IRQ scheduler.  Direct-FXE HLE does not construct
+               that IRQ return frame, so these firmware contexts must remain
+               host-emulated rather than being restored as normal game threads. */
+            direct_write32_if_ram(g, t + 0x14u, 8u);
+            direct_write32_if_ram(g, t + 0x20u, 0u);
+            direct_write32_if_ram(g, t + 0x24u, 0xffffffffu);
+        }
     }
 }
 
+static void direct_gpos_timer_note_scheduler_bounds(gp32_t *g, uint32_t callback) {
+    if (!g || !callback) return;
+    uint32_t cb = callback & ~1u;
+    if (!direct_ram_range(g, cb, 4u)) return;
+    for (uint32_t off = 0x180u; off <= 0x580u; off += 4u) {
+        uint32_t first = direct_read32_if_ram(g, cb + off + 0x10u);
+        uint32_t last_after = direct_read32_if_ram(g, cb + off + 0x14u);
+        if (!direct_gpos_task_table_bounds_valid(g, first, last_after)) continue;
+        g->direct_hle_gpos_task_first = first;
+        g->direct_hle_gpos_task_last = last_after - 0x34u;
+        g->direct_hle_gpos_scheduler_callback = cb;
+        direct_gpos_neutralize_internal_timer_tasks(g);
+        return;
+    }
+}
+
+static int direct_gpos_task_is_internal_timer(gp32_t *g, uint32_t task_addr) {
+    if (!g || !g->direct_hle_gpos_scheduler_callback || !direct_ram_range(g, task_addr, 0x34u)) return 0;
+    uint32_t entry = s3c2400_debug_read32(g->soc, task_addr + 0x30u) & ~1u;
+    uint32_t cb = g->direct_hle_gpos_scheduler_callback & ~1u;
+    return entry >= cb + 0x280u && entry < cb + 0x330u;
+}
+
+static int direct_try_emulate_gpos_counter_callback(gp32_t *g, uint32_t callback, uint32_t fires) {
+    if (!g || !fires) return 0;
+    uint32_t cb = callback & ~1u;
+    for (uint32_t off = 0x180u; off <= 0x380u; off += 4u) {
+        uint32_t sub_addr = direct_read32_if_ram(g, cb + off + 0u);
+        uint32_t threshold_addr = direct_read32_if_ram(g, cb + off + 4u);
+        uint32_t tick_addr = direct_read32_if_ram(g, cb + off + 8u);
+        if (!direct_ram_range(g, sub_addr, 4u) || !direct_ram_range(g, threshold_addr, 4u) || !direct_ram_range(g, tick_addr, 4u)) continue;
+        uint32_t threshold = direct_read32_if_ram(g, threshold_addr);
+        if (threshold == 0u || threshold > 1000000u) continue;
+        uint64_t limit = (uint64_t)threshold * 2ull;
+        uint64_t sub = direct_read32_if_ram(g, sub_addr);
+        uint64_t total = sub + (uint64_t)fires;
+        uint32_t ticks = direct_read32_if_ram(g, tick_addr);
+        ticks += (uint32_t)(total / limit);
+        sub = total % limit;
+        direct_write32_if_ram(g, sub_addr, (uint32_t)sub);
+        direct_write32_if_ram(g, tick_addr, ticks);
+        return 1;
+    }
+    return 0;
+}
+
+static int direct_gpos_callback_is_scheduler(gp32_t *g, uint32_t callback) {
+    if (!g || !callback) return 0;
+    direct_gpos_timer_note_scheduler_bounds(g, callback);
+    return g->direct_hle_gpos_scheduler_callback == (callback & ~1u);
+}
+
+static void direct_hle_gpos_timer_tick(gp32_t *g, uint32_t cycles) {
+    if (!g || !g->direct_fxe_mode || !g->direct_hle_gpos_timers_enabled || !cycles) return;
+    uint32_t clock = direct_run_clock_hz(g);
+    if (!clock) clock = 66000000u;
+    for (uint32_t i = 0; i < GP32_DIRECT_GPOS_TIMER_COUNT; ++i) {
+        uint32_t cb = g->direct_hle_gpos_timer[i].callback;
+        uint32_t tps = g->direct_hle_gpos_timer[i].tps;
+        if (!g->direct_hle_gpos_timer[i].configured || !g->direct_hle_gpos_timer[i].enabled || !cb || !tps) continue;
+        if (tps > 200000u) tps = 200000u;
+        uint64_t scaled = g->direct_hle_gpos_timer[i].accum + (uint64_t)cycles * (uint64_t)tps;
+        uint32_t fires = (uint32_t)(scaled / (uint64_t)clock);
+        g->direct_hle_gpos_timer[i].accum = scaled % (uint64_t)clock;
+        if (!fires) continue;
+        if (direct_gpos_callback_is_scheduler(g, cb)) {
+            direct_gpos_neutralize_internal_timer_tasks(g);
+            uint32_t ticks = fires > 64u ? 64u : fires;
+            for (uint32_t n = 0; n < ticks; ++n) direct_tick_sdk_task_sleepers(g, g->direct_hle_gpos_task_first, g->direct_hle_gpos_task_last);
+            continue;
+        }
+        if (direct_try_emulate_gpos_counter_callback(g, cb, fires)) continue;
+        if (tps <= 1000u && direct_ram_range(g, cb & ~1u, 4u)) {
+            uint32_t calls = fires > 8u ? 8u : fires;
+            for (uint32_t n = 0; n < calls; ++n) direct_call_guest_callback(g, cb);
+        }
+    }
+}
+
+static int direct_handle_swi_gpos_timer(gp32_t *g, arm920t_t *cpu, uint32_t pc) {
+    if (!g || !cpu) return 0;
+    uint32_t cmdp = arm920t_get_reg(cpu, 0);
+    if (!direct_ram_range(g, cmdp, 4u)) {
+        arm920t_set_reg(cpu, 0, 0u);
+        return 1;
+    }
+    uint32_t cmd = direct_read32_if_ram(g, cmdp + 0u);
+    /* Some GPSDK/GPOS task code invokes SWI #0x13 from an IRQ-return style
+       wrapper.  In direct-FXE HLE the SWI itself is handled inline, so the
+       guest's following MOVS PC,LR/SPSR path is not a real exception return.
+       Emulate the wrapper epilogue and continue at its saved LR instead. */
+    if (cmd == 2u && direct_ram_range(g, cmdp, 32u)) {
+        uint32_t selector = direct_read32_if_ram(g, cmdp + 4u);
+        uint32_t saved_spsr = direct_read32_if_ram(g, cmdp + 8u);
+        if (selector == 1u && ((saved_spsr & 0x1fu) == ARM_MODE_SVC || (saved_spsr & 0x1fu) == 0x10u || (saved_spsr & 0x1fu) == 0x1fu)) {
+            uint32_t saved_lr = direct_read32_if_ram(g, cmdp + 28u);
+            if (direct_ram_range(g, saved_lr & ~1u, 4u)) {
+                arm920t_set_reg(cpu, 0, direct_read32_if_ram(g, cmdp + 12u));
+                arm920t_set_reg(cpu, 1, direct_read32_if_ram(g, cmdp + 16u));
+                arm920t_set_reg(cpu, 2, direct_read32_if_ram(g, cmdp + 20u));
+                arm920t_set_reg(cpu, 3, direct_read32_if_ram(g, cmdp + 24u));
+                arm920t_set_reg(cpu, 13, cmdp + 32u);
+                arm920t_set_reg(cpu, 14, saved_lr);
+                arm920t_set_cpsr(cpu, saved_spsr);
+                arm920t_set_reg(cpu, 15, saved_lr & ~1u);
+                (void)pc;
+                return 1;
+            }
+        }
+    }
+    switch (cmd) {
+    case 0u:
+        direct_gpos_timer_reset(g);
+        break;
+    case 1u: {
+        uint32_t idx = direct_read32_if_ram(g, cmdp + 4u);
+        uint32_t cb = direct_read32_if_ram(g, cmdp + 8u);
+        uint32_t tps = direct_read32_if_ram(g, cmdp + 12u);
+        uint32_t max_exec = direct_read32_if_ram(g, cmdp + 16u);
+        if (idx < GP32_DIRECT_GPOS_TIMER_COUNT && direct_ram_range(g, cb & ~1u, 4u) && tps) {
+            g->direct_hle_gpos_timer[idx].configured = 1u;
+            g->direct_hle_gpos_timer[idx].enabled = 0u;
+            g->direct_hle_gpos_timer[idx].callback = cb;
+            g->direct_hle_gpos_timer[idx].tps = tps;
+            g->direct_hle_gpos_timer[idx].max_exec_tick = max_exec;
+            g->direct_hle_gpos_timer[idx].accum = 0u;
+            direct_gpos_timer_note_scheduler_bounds(g, cb);
+        }
+        break;
+    }
+    case 2u: {
+        uint32_t arg = direct_read32_if_ram(g, cmdp + 4u);
+        if (arg < GP32_DIRECT_GPOS_TIMER_COUNT && g->direct_hle_gpos_timer[arg].configured) {
+            g->direct_hle_gpos_timer[arg].enabled = 1u;
+        } else {
+            for (uint32_t i = 0; i < GP32_DIRECT_GPOS_TIMER_COUNT; ++i) {
+                if (g->direct_hle_gpos_timer[i].configured) g->direct_hle_gpos_timer[i].enabled = 1u;
+            }
+        }
+        g->direct_hle_gpos_timers_enabled = 1u;
+        direct_gpos_neutralize_internal_timer_tasks(g);
+        break;
+    }
+    case 3u: {
+        uint32_t idx = direct_read32_if_ram(g, cmdp + 4u);
+        if (idx < GP32_DIRECT_GPOS_TIMER_COUNT) g->direct_hle_gpos_timer[idx].enabled = 0u;
+        break;
+    }
+    case 4u: {
+        uint32_t idx = direct_read32_if_ram(g, cmdp + 4u);
+        if (idx < GP32_DIRECT_GPOS_TIMER_COUNT && g->direct_hle_gpos_timer[idx].configured) {
+            g->direct_hle_gpos_timer[idx].enabled = 1u;
+            g->direct_hle_gpos_timers_enabled = 1u;
+            direct_gpos_neutralize_internal_timer_tasks(g);
+        }
+        break;
+    }
+    case 5u: {
+        uint32_t idx = direct_read32_if_ram(g, cmdp + 4u);
+        if (idx < GP32_DIRECT_GPOS_TIMER_COUNT) memset(&g->direct_hle_gpos_timer[idx], 0, sizeof(g->direct_hle_gpos_timer[idx]));
+        break;
+    }
+    default:
+        break;
+    }
+    arm920t_set_reg(cpu, 0, 0u);
+    return 1;
+}
 
 static void direct_sdk_pcm_refill_tick(gp32_t *g) {
     if (!g || !g->direct_hle_sdk_sndmixer_addr) return;
@@ -1551,23 +1968,6 @@ static int direct_handle_swi_iis(gp32_t *g, arm920t_t *cpu) {
 
 static void direct_hle_audio_tick(gp32_t *g, uint32_t cycles) {
     if (!g || !cycles) return;
-    if (g->direct_hle_audio_asset && g->direct_hle_audio_rate) {
-        if (g->direct_hle_audio_pos >= g->direct_hle_audio_size) {
-            direct_stop_sef(g);
-        } else {
-            uint32_t clock = direct_firmware_clock_hz(g);
-            uint64_t scaled = g->direct_hle_audio_accum + (uint64_t)cycles * (uint64_t)g->direct_hle_audio_rate;
-            uint32_t frames = (uint32_t)(scaled / (uint64_t)clock);
-            g->direct_hle_audio_accum = scaled % (uint64_t)clock;
-            if (frames) {
-                uint32_t remain = g->direct_hle_audio_size - g->direct_hle_audio_pos;
-                if (frames > remain) frames = remain;
-                s3c2400_audio_append_u8_mono(g->soc, g->direct_hle_audio_asset->data + 8u + g->direct_hle_audio_pos, frames, g->direct_hle_audio_rate);
-                g->direct_hle_audio_pos += frames;
-                if (g->direct_hle_audio_pos >= g->direct_hle_audio_size) direct_stop_sef(g);
-            }
-        }
-    }
     direct_hle_pcm_tick(g, cycles);
     direct_sdk_sound_tick(g, cycles);
 }
@@ -1686,7 +2086,7 @@ static void direct_scan_file_hle(gp32_t *g) {
             if (retail_seek_like) {
                 g->direct_hle_file_seek_addr = a;
                 s3c2400_write32(g->soc, a, 0xef070005u);
-            } else if (!retail_write_like && (retail_read_like || body_target == 0u)) {
+            } else if (!retail_write_like && (retail_read_like || body_target == 0u || g->direct_hle_file_read_addr[0] == body_target || g->direct_hle_file_read_addr[1] == body_target)) {
                 if (!g->direct_hle_file_read_addr[0]) {
                     g->direct_hle_file_read_addr[0] = a;
                 } else if (g->direct_hle_file_read_addr[0] != a && !g->direct_hle_file_read_addr[1]) {
@@ -2271,7 +2671,9 @@ static int direct_file_hle_swi(gp32_t *g, arm920t_t *cpu, uint32_t id, uint32_t 
             g->direct_hle_pcm_stereo = 0u;
             g->direct_hle_pcm_bits = 16u;
         }
-        int ok = direct_start_pcm(g, arm920t_get_reg(cpu, 0), arm920t_get_reg(cpu, 1), arm920t_get_reg(cpu, 2));
+        uint32_t ch = 0xffffffffu;
+        int ok = direct_start_pcm(g, arm920t_get_reg(cpu, 0), arm920t_get_reg(cpu, 1), arm920t_get_reg(cpu, 2), &ch);
+        GP32_UNUSED(ch);
         arm920t_set_reg(cpu, 0, ok ? 0u : 1u);
         arm920t_set_reg(cpu, 15, lr);
         return 1;
@@ -2301,17 +2703,21 @@ static int direct_file_hle_swi(gp32_t *g, arm920t_t *cpu, uint32_t id, uint32_t 
     }
     if (id == 13u) { /* GpPcmRemove(src) */
         uint32_t src = arm920t_get_reg(cpu, 0);
-        if (!src || src == g->direct_hle_pcm_src_addr) direct_stop_pcm(g);
+        direct_stop_pcm_src(g, src);
         arm920t_set_reg(cpu, 0, 0u);
         arm920t_set_reg(cpu, 15, lr);
         return 1;
     }
     if (id == 14u) { /* GpPcmLock(src, &idx_buf, &addr_of_playing_buf) */
         uint32_t src = arm920t_get_reg(cpu, 0);
-        if (g->direct_hle_pcm_active && (!src || src == g->direct_hle_pcm_src_addr)) {
+        uint32_t found = GP32_DIRECT_PCM_CHANNELS;
+        for (uint32_t ch = 0; ch < GP32_DIRECT_PCM_CHANNELS; ++ch) {
+            if (g->direct_hle_pcm_ch[ch].active && (!src || g->direct_hle_pcm_ch[ch].src_addr == src)) { found = ch; break; }
+        }
+        if (found < GP32_DIRECT_PCM_CHANNELS) {
             direct_pcm_update_cursor(g);
-            direct_write32_if_ram(g, arm920t_get_reg(cpu, 1), 0u);
-            direct_write32_if_ram(g, arm920t_get_reg(cpu, 2), direct_pcm_cursor_addr(g));
+            direct_write32_if_ram(g, arm920t_get_reg(cpu, 1), found);
+            direct_write32_if_ram(g, arm920t_get_reg(cpu, 2), direct_pcm_cursor_addr_channel(g, found));
             arm920t_set_reg(cpu, 0, 1u);
         } else {
             arm920t_set_reg(cpu, 0, 0u);
@@ -2321,7 +2727,7 @@ static int direct_file_hle_swi(gp32_t *g, arm920t_t *cpu, uint32_t id, uint32_t 
     }
     if (id == 15u) { /* GpPcmOnlyKill(src) */
         uint32_t src = arm920t_get_reg(cpu, 0);
-        if (!src || src == g->direct_hle_pcm_src_addr) direct_stop_pcm(g);
+        direct_stop_pcm_src(g, src);
         arm920t_set_reg(cpu, 0, 0u);
         arm920t_set_reg(cpu, 15, lr);
         return 1;
@@ -2477,9 +2883,8 @@ static int direct_fxe_swi(void *user, arm920t_t *cpu, uint32_t imm, uint32_t pc,
     }
     case 0x0e: /* GPSDK sound-buffer allocator used by GpPcmInit. */
         return direct_handle_swi_set_sndbuffer(g, cpu);
-    case 0x13: /* GPOS timer/scheduler service: direct-load accepts the request. */
-        arm920t_set_reg(cpu, 0, 0u);
-        return 1;
+    case 0x13: /* GPSDK/GPOS timer and scheduler command-block service. */
+        return direct_handle_swi_gpos_timer(g, cpu, pc);
     case 0x11: { /* Direct-mode display callback for GpSurfaceSet/GpSurfaceFlip. */
         uint32_t a0 = arm920t_get_reg(cpu, 0);
         uint32_t fb = direct_read_surface_buffer(g, a0);
@@ -2598,28 +3003,27 @@ static int direct_fxe_swi(void *user, arm920t_t *cpu, uint32_t imm, uint32_t pc,
             uint32_t in0 = direct_key_port_value(g, arm920t_get_reg(cpu, 1));
             uint32_t in1 = direct_key_port_value(g, arm920t_get_reg(cpu, 2));
             /*
-             * GP32 SDK key wrappers pass debounced active-low GPIO samples to
-             * this firmware helper and then invert the returned virtual-key
-             * word before handing it to games.  The BIOS-side value must
-             * therefore be active-low as well: all bits high when idle, and a
-             * virtual-key bit cleared when its button is pressed.  Returning
-             * active-high here makes the public SDK result become
-             * 0xffffffff when no button is pressed, which menu/story code can
-             * mask over but gameplay code interprets as every direction and
-             * action being held.
+             * This is the low-level firmware virtual-key mapper used by the
+             * GPSDK _VirtualKeyMap routine, not the public GpKeyGet() ABI.
+             * The SDK routine calls SWI #0x10 and then MVN's R0 before
+             * returning to the game, so the firmware value must remain
+             * active-low: 1 bits mean released, 0 bits mean pressed.
+             * Returning active-high here made GpKeyGet() become ~keys, which
+             * looked like every control was held; AKA NOID then drifted left
+             * and ran its menus/gameplay controls erratically.
              */
-            uint32_t keys = 0xffffffffu;
-            if ((in0 & 0x0100u) == 0u) keys &= ~0x001u; /* GPC_VK_LEFT */
-            if ((in0 & 0x0200u) == 0u) keys &= ~0x002u; /* GPC_VK_DOWN */
-            if ((in0 & 0x0400u) == 0u) keys &= ~0x004u; /* GPC_VK_RIGHT */
-            if ((in0 & 0x0800u) == 0u) keys &= ~0x008u; /* GPC_VK_UP */
-            if ((in0 & 0x1000u) == 0u) keys &= ~0x010u; /* GPC_VK_FL */
-            if ((in0 & 0x2000u) == 0u) keys &= ~0x020u; /* GPC_VK_FB */
-            if ((in0 & 0x4000u) == 0u) keys &= ~0x040u; /* GPC_VK_FA */
-            if ((in0 & 0x8000u) == 0u) keys &= ~0x080u; /* GPC_VK_FR */
-            if ((in1 & 0x0040u) == 0u) keys &= ~0x100u; /* GPC_VK_START */
-            if ((in1 & 0x0080u) == 0u) keys &= ~0x200u; /* GPC_VK_SELECT */
-            arm920t_set_reg(cpu, 0, keys);
+            uint32_t keys = 0u;
+            if ((in0 & 0x0100u) == 0u) keys |= 0x001u; /* GPC_VK_LEFT */
+            if ((in0 & 0x0200u) == 0u) keys |= 0x002u; /* GPC_VK_DOWN */
+            if ((in0 & 0x0400u) == 0u) keys |= 0x004u; /* GPC_VK_RIGHT */
+            if ((in0 & 0x0800u) == 0u) keys |= 0x008u; /* GPC_VK_UP */
+            if ((in0 & 0x1000u) == 0u) keys |= 0x010u; /* GPC_VK_FL */
+            if ((in0 & 0x2000u) == 0u) keys |= 0x020u; /* GPC_VK_FB */
+            if ((in0 & 0x4000u) == 0u) keys |= 0x040u; /* GPC_VK_FA */
+            if ((in0 & 0x8000u) == 0u) keys |= 0x080u; /* GPC_VK_FR */
+            if ((in1 & 0x0040u) == 0u) keys |= 0x100u; /* GPC_VK_START */
+            if ((in1 & 0x0080u) == 0u) keys |= 0x200u; /* GPC_VK_SELECT */
+            arm920t_set_reg(cpu, 0, ~keys);
             return 1;
         }
         arm920t_set_reg(cpu, 0, 0xffffffffu);
@@ -2640,7 +3044,7 @@ static int direct_fxe_swi(void *user, arm920t_t *cpu, uint32_t imm, uint32_t pc,
         switch (selector) {
         case 1u: /* palette realize / vblank-safe update */
         case 2u: /* fast palette update */
-            direct_realize_software_palette_from(g, 0u, 0);
+            direct_realize_software_palette_from(g, arg2, 1);
             arm920t_set_reg(cpu, 0, 1u);
             return 1;
         case 3u: /* palette operation accepted; keep current addresses stable. */
@@ -2729,6 +3133,7 @@ gp32_t *gp32_create(const gp32_options_t *opt) {
 void gp32_destroy(gp32_t *g) {
     if (!g) return;
     direct_clear_fpk_assets(g);
+    direct_clear_reset_image(g);
     arm920t_destroy(g->cpu);
     s3c2400_destroy(g->soc);
     free(g);
@@ -2811,11 +3216,12 @@ gp32_status_t gp32_load_smartmedia_direct(gp32_t *g, const char *path) {
     }
     direct_smc_set_launch_paths(g, pkg.executable_path);
     direct_clear_fpk_assets(g);
+    direct_clear_reset_image(g);
     g->direct_fpk_assets = pkg.assets;
     g->direct_fpk_asset_count = pkg.asset_count;
     pkg.assets = NULL;
     pkg.asset_count = 0;
-    gp32_status_t st = gp32_load_fxe_image(g, &pkg.image);
+    gp32_status_t st = gp32_load_fxe_image_internal(g, &pkg.image, 1, 1, 1, 0);
     if (st == GP32_OK) {
         direct_init_smc_gpio(g);
         direct_scan_file_hle(g);
@@ -2834,11 +3240,12 @@ gp32_status_t gp32_load_smartmedia_direct_data(gp32_t *g, const void *data, size
     }
     direct_smc_set_launch_paths(g, pkg.executable_path);
     direct_clear_fpk_assets(g);
+    direct_clear_reset_image(g);
     g->direct_fpk_assets = pkg.assets;
     g->direct_fpk_asset_count = pkg.asset_count;
     pkg.assets = NULL;
     pkg.asset_count = 0;
-    gp32_status_t st = gp32_load_fxe_image(g, &pkg.image);
+    gp32_status_t st = gp32_load_fxe_image_internal(g, &pkg.image, 1, 1, 1, 0);
     if (st == GP32_OK) {
         direct_init_smc_gpio(g);
         direct_scan_file_hle(g);
@@ -2847,9 +3254,11 @@ gp32_status_t gp32_load_smartmedia_direct_data(gp32_t *g, const void *data, size
     return st;
 }
 
-static gp32_status_t gp32_load_fxe_image(gp32_t *g, fxe_image_t *img) {
+static gp32_status_t gp32_load_fxe_image_internal(gp32_t *g, fxe_image_t *img, int update_reset_image, int scan_file_hle, int init_smc_gpio, int preserve_hle_options) {
     char e[256] = {0};
+    direct_reset_hle_runtime(g, preserve_hle_options);
     s3c2400_reset(g->soc);
+    s3c2400_install_hle_bios(g->soc);
     if (!s3c2400_load_ram_image(g->soc, img->load_addr, img->payload, img->payload_size, e, sizeof(e))) {
         seterr(g, "%s", e[0] ? e : "FXE RAM load failed");
         return GP32_ERR_BAD_IMAGE;
@@ -2881,7 +3290,15 @@ static gp32_status_t gp32_load_fxe_image(gp32_t *g, fxe_image_t *img) {
     arm920t_set_reg(g->cpu, 13, g->direct_fxe_stack - 16u);
     arm920t_set_reg(g->cpu, 0, img->load_addr);
     arm920t_set_reg(g->cpu, 1, g->direct_fxe_stack - 16u);
+    if (update_reset_image && !direct_store_reset_image(g, img, scan_file_hle, init_smc_gpio)) {
+        seterr(g, "out of memory storing direct-HLE reset image");
+        return GP32_ERR_IO;
+    }
     return GP32_OK;
+}
+
+static gp32_status_t gp32_load_fxe_image(gp32_t *g, fxe_image_t *img) {
+    return gp32_load_fxe_image_internal(g, img, 1, 0, 0, 0);
 }
 
 gp32_status_t gp32_load_fxe(gp32_t *g, const char *path) {
@@ -2889,6 +3306,8 @@ gp32_status_t gp32_load_fxe(gp32_t *g, const char *path) {
     fxe_image_t img;
     char e[256] = {0};
     if (!fxe_load_file(path, &img, e, sizeof(e))) { seterr(g, "%s", e[0] ? e : "FXE load failed"); return GP32_ERR_BAD_IMAGE; }
+    direct_clear_fpk_assets(g);
+    direct_clear_reset_image(g);
     gp32_status_t st = gp32_load_fxe_image(g, &img);
     fxe_image_free(&img);
     return st;
@@ -2899,6 +3318,8 @@ gp32_status_t gp32_load_fxe_data(gp32_t *g, const void *data, size_t size, const
     fxe_image_t img;
     char e[256] = {0};
     if (!fxe_load_buffer((const uint8_t *)data, size, label ? label : "buffer", &img, e, sizeof(e))) { seterr(g, "%s", e[0] ? e : "FXE buffer load failed"); return GP32_ERR_BAD_IMAGE; }
+    direct_clear_fpk_assets(g);
+    direct_clear_reset_image(g);
     gp32_status_t st = gp32_load_fxe_image(g, &img);
     fxe_image_free(&img);
     return st;
@@ -2925,11 +3346,12 @@ gp32_status_t gp32_load_fpk(gp32_t *g, const char *path) {
         img.title[n] = '\0';
     }
     direct_clear_fpk_assets(g);
+    direct_clear_reset_image(g);
     g->direct_fpk_assets = pkg.assets;
     g->direct_fpk_asset_count = pkg.asset_count;
     pkg.assets = NULL;
     pkg.asset_count = 0;
-    gp32_status_t st = gp32_load_fxe_image(g, &img);
+    gp32_status_t st = gp32_load_fxe_image_internal(g, &img, 1, 1, 0, 0);
     if (st == GP32_OK) direct_scan_file_hle(g);
     fxe_image_free(&img);
     fpk_package_free(&pkg);
@@ -2961,7 +3383,7 @@ gp32_status_t gp32_load_fpk_data(gp32_t *g, const void *data, size_t size, const
     g->direct_fpk_asset_count = pkg.asset_count;
     pkg.assets = NULL;
     pkg.asset_count = 0;
-    gp32_status_t st = gp32_load_fxe_image(g, &img);
+    gp32_status_t st = gp32_load_fxe_image_internal(g, &img, 1, 1, 0, 0);
     if (st == GP32_OK) direct_scan_file_hle(g);
     fxe_image_free(&img);
     fpk_package_free(&pkg);
@@ -2977,6 +3399,14 @@ gp32_status_t gp32_save_smartmedia(gp32_t *g, const char *path) {
 
 gp32_status_t gp32_reset(gp32_t *g) {
     if (!g) return GP32_ERR_INVALID_ARGUMENT;
+    if (g->direct_reset_image_valid && g->direct_reset_image.payload && g->direct_reset_image.payload_size) {
+        gp32_status_t st = gp32_load_fxe_image_internal(g, &g->direct_reset_image, 0, g->direct_reset_scan_file_hle, g->direct_reset_init_smc_gpio, 1);
+        if (st == GP32_OK) {
+            if (g->direct_reset_init_smc_gpio) direct_init_smc_gpio(g);
+            if (g->direct_reset_scan_file_hle) direct_scan_file_hle(g);
+        }
+        return st;
+    }
     g->direct_fxe_mode = 0;
     g->direct_fxe_fb_addr = 0;
     g->direct_fxe_image_end = 0;
@@ -2992,6 +3422,7 @@ gp32_status_t gp32_reset(gp32_t *g) {
         g->direct_fxe_lcd_surface[i] = 0;
         g->direct_fxe_surface_checksum[i] = 0;
     }
+    direct_reset_hle_runtime(g, 1);
     s3c2400_reset(g->soc);
     arm920t_reset(g->cpu, 0x00000000u);
     return GP32_OK;
@@ -3015,8 +3446,9 @@ static int direct_task_record_plausible(gp32_t *g, uint32_t task_addr) {
 
 static int direct_task_state_can_run(gp32_t *g, uint32_t task_addr) {
     if (!direct_task_record_plausible(g, task_addr)) return 0;
+    if (direct_gpos_task_is_internal_timer(g, task_addr)) return 0;
     uint32_t state = s3c2400_debug_read32(g->soc, task_addr + 0x14u);
-    if (state == 1u || state == 2u || state == 8u) return 1;
+    if (state == 1u || state == 2u) return 1;
     if (state == 4u) {
         uint32_t elapsed = s3c2400_debug_read32(g->soc, task_addr + 0x20u);
         uint32_t limit = s3c2400_debug_read32(g->soc, task_addr + 0x24u);
@@ -3065,6 +3497,7 @@ static void direct_tick_sdk_task_sleepers(gp32_t *g, uint32_t first_task, uint32
     direct_task_scan_bounds(g, first_task, last_task, &start, &end, &step);
     for (uint32_t t = start; t + 0x34u <= end; t += step) {
         if (!direct_task_record_plausible(g, t)) continue;
+        if (direct_gpos_task_is_internal_timer(g, t)) continue;
         if (s3c2400_debug_read32(g->soc, t + 0x14u) != 4u) continue;
         uint32_t saved_sp = s3c2400_debug_read32(g->soc, t + 0u);
         if (!direct_ram_range(g, saved_sp, 64u)) continue;
@@ -3088,6 +3521,7 @@ static int direct_resume_ready_sdk_task(gp32_t *g, uint32_t pc, uint32_t first_t
     direct_task_scan_bounds(g, first_task, last_task, &start, &end, &step);
     for (uint32_t t = start; t + 0x34u <= end; t += step) {
         if (!direct_task_record_plausible(g, t)) continue;
+        if (direct_gpos_task_is_internal_timer(g, t)) continue;
         uint32_t state = s3c2400_debug_read32(g->soc, t + 0x14u);
         if (state != 2u) continue;
         uint32_t saved_sp = s3c2400_debug_read32(g->soc, t + 0u);
@@ -3144,7 +3578,7 @@ static int direct_try_resume_sdk_task(gp32_t *g) {
         uint32_t current = s3c2400_debug_read32(g->soc, current_slot);
         for (unsigned i = 0; i < 8u; ++i) {
             uint32_t t = task_base + i * 0x34u;
-            if (t == current) continue;
+            if (t == current || direct_gpos_task_is_internal_timer(g, t)) continue;
             uint32_t saved_sp = s3c2400_debug_read32(g->soc, t + 0u);
             if (!direct_task_state_can_run(g, t) || !direct_ram_range(g, saved_sp, 64u)) continue;
             uint32_t new_pc = s3c2400_debug_read32(g->soc, saved_sp + 60u);
@@ -3166,6 +3600,7 @@ static int direct_try_resume_sdk_task(gp32_t *g) {
     uint32_t ram_end = GP32_RAM_BASE + (uint32_t)s3c2400_ram_size(g->soc);
     for (uint32_t t = GP32_RAM_BASE; t + 0x34u < ram_end; t += 4u) {
         uint32_t state = s3c2400_debug_read32(g->soc, t + 0x14u);
+        if (direct_gpos_task_is_internal_timer(g, t)) continue;
         if (state == 4u && direct_task_record_plausible(g, t)) {
             /*
              * Firmware-resident GPSDK schedulers sleep tasks by marking their
@@ -3225,6 +3660,7 @@ gp32_status_t gp32_run_cycles(gp32_t *g, uint32_t cycles) {
         direct_update_fw_tick(g);
         uint32_t done = arm920t_run(g->cpu, slice);
         s3c2400_tick(g->soc, done);
+        direct_hle_gpos_timer_tick(g, done);
         direct_hle_audio_tick(g, done);
         direct_update_fw_tick(g);
         direct_process_asset_autoload(g);
@@ -3386,6 +3822,18 @@ typedef struct gp32_state_image {
     uint64_t direct_hle_sdk_timer_accum;
     uint32_t direct_hle_sdk_submitted_frames;
     uint32_t direct_hle_sdk_timer_table_addr;
+    struct {
+        uint32_t configured;
+        uint32_t enabled;
+        uint32_t callback;
+        uint32_t tps;
+        uint32_t max_exec_tick;
+        uint64_t accum;
+    } direct_hle_gpos_timer[GP32_DIRECT_GPOS_TIMER_COUNT];
+    uint32_t direct_hle_gpos_timers_enabled;
+    uint32_t direct_hle_gpos_task_first;
+    uint32_t direct_hle_gpos_task_last;
+    uint32_t direct_hle_gpos_scheduler_callback;
     uint32_t direct_hle_callback_returned;
     uint32_t direct_hle_callback_running;
     uint32_t direct_hle_audio_rate_override;
@@ -3483,6 +3931,11 @@ static void gp32_direct_state_capture(const gp32_t *g, gp32_state_image_t *st) {
     st->direct_hle_sdk_timer_accum = g->direct_hle_sdk_timer_accum;
     st->direct_hle_sdk_submitted_frames = g->direct_hle_sdk_submitted_frames;
     st->direct_hle_sdk_timer_table_addr = g->direct_hle_sdk_timer_table_addr;
+    memcpy(st->direct_hle_gpos_timer, g->direct_hle_gpos_timer, sizeof(st->direct_hle_gpos_timer));
+    st->direct_hle_gpos_timers_enabled = g->direct_hle_gpos_timers_enabled;
+    st->direct_hle_gpos_task_first = g->direct_hle_gpos_task_first;
+    st->direct_hle_gpos_task_last = g->direct_hle_gpos_task_last;
+    st->direct_hle_gpos_scheduler_callback = g->direct_hle_gpos_scheduler_callback;
     st->direct_hle_callback_returned = g->direct_hle_callback_returned;
     st->direct_hle_callback_running = g->direct_hle_callback_running;
     st->direct_hle_audio_rate_override = g->direct_hle_audio_rate_override;
@@ -3550,6 +4003,17 @@ static void gp32_direct_state_apply(gp32_t *g, const gp32_state_image_t *st) {
     g->direct_hle_pcm_pos_bytes = st->direct_hle_pcm_pos_bytes;
     g->direct_hle_pcm_repeat = st->direct_hle_pcm_repeat;
     g->direct_hle_pcm_accum = st->direct_hle_pcm_accum;
+    memset(g->direct_hle_pcm_ch, 0, sizeof(g->direct_hle_pcm_ch));
+    if (g->direct_hle_pcm_active) {
+        g->direct_hle_pcm_ch[0].active = g->direct_hle_pcm_active;
+        g->direct_hle_pcm_ch[0].src_addr = g->direct_hle_pcm_src_addr;
+        g->direct_hle_pcm_ch[0].size_bytes = g->direct_hle_pcm_size_bytes;
+        g->direct_hle_pcm_ch[0].pos_bytes = g->direct_hle_pcm_pos_bytes;
+        g->direct_hle_pcm_ch[0].repeat = g->direct_hle_pcm_repeat;
+        g->direct_hle_pcm_ch[0].rate = g->direct_hle_pcm_rate;
+        g->direct_hle_pcm_ch[0].stereo = g->direct_hle_pcm_stereo;
+        g->direct_hle_pcm_ch[0].bits = g->direct_hle_pcm_bits;
+    }
     g->direct_hle_sdk_sndmixedbuf_addr = st->direct_hle_sdk_sndmixedbuf_addr;
     g->direct_hle_sdk_sndsrcexist_addr = st->direct_hle_sdk_sndsrcexist_addr;
     g->direct_hle_sdk_pcm_workidx_addr = st->direct_hle_sdk_pcm_workidx_addr;
@@ -3563,6 +4027,11 @@ static void gp32_direct_state_apply(gp32_t *g, const gp32_state_image_t *st) {
     g->direct_hle_sdk_timer_accum = st->direct_hle_sdk_timer_accum;
     g->direct_hle_sdk_submitted_frames = st->direct_hle_sdk_submitted_frames;
     g->direct_hle_sdk_timer_table_addr = st->direct_hle_sdk_timer_table_addr;
+    memcpy(g->direct_hle_gpos_timer, st->direct_hle_gpos_timer, sizeof(g->direct_hle_gpos_timer));
+    g->direct_hle_gpos_timers_enabled = st->direct_hle_gpos_timers_enabled;
+    g->direct_hle_gpos_task_first = st->direct_hle_gpos_task_first;
+    g->direct_hle_gpos_task_last = st->direct_hle_gpos_task_last;
+    g->direct_hle_gpos_scheduler_callback = st->direct_hle_gpos_scheduler_callback;
     g->direct_hle_callback_returned = st->direct_hle_callback_returned;
     g->direct_hle_callback_running = st->direct_hle_callback_running;
     g->direct_hle_audio_rate_override = st->direct_hle_audio_rate_override;

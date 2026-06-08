@@ -103,8 +103,8 @@ uint32_t gp32_sdl3_input_keyboard_buttons(void) {
     if (keys[SDL_SCANCODE_X])      mask |= GP32_BUTTON_B;
     if (keys[SDL_SCANCODE_A])      mask |= GP32_BUTTON_L;
     if (keys[SDL_SCANCODE_S])      mask |= GP32_BUTTON_R;
-    if (keys[SDL_SCANCODE_RETURN]) mask |= GP32_BUTTON_START;
-    if (keys[SDL_SCANCODE_RSHIFT] || keys[SDL_SCANCODE_LSHIFT]) mask |= GP32_BUTTON_SELECT;
+    if (keys[SDL_SCANCODE_RETURN] || keys[SDL_SCANCODE_SPACE]) mask |= GP32_BUTTON_START;
+    if (keys[SDL_SCANCODE_RSHIFT] || keys[SDL_SCANCODE_LSHIFT] || keys[SDL_SCANCODE_C]) mask |= GP32_BUTTON_SELECT;
     return mask;
 }
 

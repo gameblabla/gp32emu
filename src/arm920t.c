@@ -663,12 +663,14 @@ static void op_block_dt(arm920t_t *c, uint32_t insn) {
     if (u) addr = p ? base + 4 : base;
     else addr = p ? base - 4u * count : base - 4u * count + 4u;
     uint32_t final_base = u ? base + 4u * count : base - 4u * count;
-    int user_transfer = s && !(l && (list & (1u << 15)));
+    int exception_return = l && s && (list & (1u << 15));
+    int user_transfer = s && !exception_return;
+    uint32_t loaded_pc = 0u;
     for (unsigned r=0;r<16;r++) if (list & (1u<<r)) {
         if (l) {
             uint32_t v = rb32(c, addr);
             if (user_transfer) write_user_r(c, r, v);
-            else if (r == 15) write_pc_x(c, v); else c->r[r] = v;
+            else if (r == 15) { if (exception_return) loaded_pc = v; else write_pc_x(c, v); } else c->r[r] = v;
         } else {
             uint32_t v = user_transfer ? read_user_r(c, r) : ((r == 15) ? c->r[15] + 4u : c->r[r]);
             wb32(c, addr, v);
@@ -676,7 +678,10 @@ static void op_block_dt(arm920t_t *c, uint32_t insn) {
         addr += 4;
     }
     if (w && (!l || ((list & (1u << rn)) == 0))) write_r(c, rn, final_base);
-    if (l && (list & (1u << 15)) && s) restore_cpsr_from_spsr(c);
+    if (exception_return) {
+        restore_cpsr_from_spsr(c);
+        write_pc_x(c, loaded_pc);
+    }
 }
 
 static uint32_t cp15_read(arm920t_t *c, unsigned crn, unsigned crm, unsigned op1, unsigned op2) {
@@ -1434,13 +1439,15 @@ ARM_FORCE_INLINE void op_block_dt_bc(arm920t_t *c, const arm_jit_op_t *op) {
     if (u) addr = p ? base + 4u : base;
     else addr = p ? base - 4u * count : base - 4u * count + 4u;
     uint32_t final_base = u ? base + 4u * count : base - 4u * count;
-    int user_transfer = s && !(l && (list & (1u << 15)));
+    int exception_return = l && s && (list & (1u << 15));
+    int user_transfer = s && !exception_return;
+    uint32_t loaded_pc = 0u;
     for (uint32_t regs = list; regs; regs &= regs - 1u) {
         unsigned r = arm_ctz16(regs);
         if (l) {
             uint32_t v = arm_bc_ld_word(c, addr);
             if (user_transfer) write_user_r(c, r, v);
-            else if (r == 15u) write_pc_x(c, v); else c->r[r] = v;
+            else if (r == 15u) { if (exception_return) loaded_pc = v; else write_pc_x(c, v); } else c->r[r] = v;
         } else {
             uint32_t v = user_transfer ? read_user_r(c, r) : ((r == 15u) ? c->r[15] + 4u : c->r[r]);
             arm_bc_st_word(c, addr, v);
@@ -1448,7 +1455,10 @@ ARM_FORCE_INLINE void op_block_dt_bc(arm920t_t *c, const arm_jit_op_t *op) {
         addr += 4u;
     }
     if (w && (!l || ((list & (1u << rn)) == 0))) write_r(c, rn, final_base);
-    if (l && (list & (1u << 15)) && s) restore_cpsr_from_spsr(c);
+    if (exception_return) {
+        restore_cpsr_from_spsr(c);
+        write_pc_x(c, loaded_pc);
+    }
 }
 
 ARM_FORCE_INLINE void arm_jit_exec_classified(arm920t_t *c, const arm_jit_op_t *op) {
