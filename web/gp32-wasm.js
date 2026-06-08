@@ -159,6 +159,7 @@ let audioUnderruns = 0;
 let audioStarted = false;
 let pseudoFullscreen = false;
 let hiddenPauseWasRunning = false;
+let resumePending = false;
 let frameLimiterLastTime = 0;
 let frameLimiterAccumMs = 0;
 let videoLayoutDirty = true;
@@ -216,7 +217,17 @@ function saveConfig() {
 }
 
 function log(msg) { logEl.textContent = msg || ''; }
-function setState(msg) { stateText.textContent = msg; if (config.showFpsHud === true) hud.textContent = msg; }
+function coreIsStarted() {
+  return !!(exp && exp.gp32_wasm_get_status && exp.gp32_wasm_get_status() === 2);
+}
+function updatePauseButton() {
+  if (!pauseBtn) return;
+  const canResume = coreIsStarted();
+  pauseBtn.textContent = running ? 'Pause' : (canResume ? 'Play' : 'Pause');
+  pauseBtn.title = running ? 'Pause emulation' : (canResume ? 'Resume emulation' : 'Start the emulator before using pause');
+  pauseBtn.setAttribute('aria-label', running ? 'Pause emulation' : (canResume ? 'Resume emulation' : 'Pause emulation'));
+}
+function setState(msg) { stateText.textContent = msg; if (config.showFpsHud === true) hud.textContent = msg; updatePauseButton(); }
 function setStorageStatus(msg, tone = 'muted') {
   if (!storageText) return;
   storageText.textContent = msg || '';
@@ -855,11 +866,42 @@ async function start() {
   raf = requestAnimationFrame(loop);
 }
 function pause() {
+  if (!running) return;
   hiddenPauseWasRunning = false;
   running = false;
   cancelAnimationFrame(raf);
   document.body.classList.remove('running');
   setState('paused');
+}
+async function resume() {
+  if (running || resumePending) return;
+  if (!coreIsStarted()) { log('Start the emulator before using Play.'); updatePauseButton(); return; }
+  resumePending = true;
+  hiddenPauseWasRunning = false;
+  try {
+    try { await ensureAudio(true); } catch (_) {}
+    resetAudioQueues();
+    clearAllInput();
+    running = true;
+    framesThisSecond = 0;
+    displayFramesThisSecond = 0;
+    lastFpsTime = performance.now();
+    lastStatsDomTime = 0;
+    lastAudioDomTime = 0;
+    lastDrawnCoreFrame = -1;
+    resetFrameLimiter(lastFpsTime);
+    document.body.classList.add('running');
+    setState('running');
+    cancelAnimationFrame(raf);
+    raf = requestAnimationFrame(loop);
+  } finally {
+    resumePending = false;
+    updatePauseButton();
+  }
+}
+function togglePause() {
+  if (running) pause();
+  else resume();
 }
 function pauseForHiddenTab() {
   if (!running) return;
@@ -955,6 +997,8 @@ async function loadStateFromStorage() {
   const ok = exp.gp32_wasm_load_state(ptr, bytes.byteLength);
   if (!ok) {
     running = wasRunning;
+    document.body.classList.toggle('running', running);
+    updatePauseButton();
     if (running) raf = requestAnimationFrame(loop);
     return setStorageStatus(`state rejected: ${errorText()}`, 'bad');
   }
@@ -966,6 +1010,7 @@ async function loadStateFromStorage() {
   setState(wasRunning ? 'running' : 'paused');
   running = wasRunning;
   document.body.classList.toggle('running', running);
+  updatePauseButton();
   if (running) raf = requestAnimationFrame(loop);
 }
 async function exportStateToFile() {
@@ -1538,7 +1583,8 @@ function bindFilesAndControls() {
   document.getElementById('biosFile').addEventListener('change', e => { const f = e.target.files[0]; if (f) loadBiosFile(f); });
   document.getElementById('gameFile').addEventListener('change', e => { const f = e.target.files[0]; if (f) loadGameFile(f); });
   startBtn.addEventListener('click', start);
-  pauseBtn.addEventListener('click', pause);
+  pauseBtn.addEventListener('click', togglePause);
+  updatePauseButton();
   saveStateBtn?.addEventListener('click', () => saveStateToStorage());
   loadStateBtn?.addEventListener('click', () => loadStateFromStorage());
   exportStateBtn?.addEventListener('click', () => exportStateToFile());
