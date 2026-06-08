@@ -30,7 +30,7 @@ SOURCES += \
     src/smc_direct.c \
     src/fxe.c \
     src/fpk.c \
-    src/zip.c \
+    src/gp32_zip.c \
     src/third_party/zip/zip.c \
     src/input_script.c \
     src/platform/platform.c \
@@ -63,14 +63,15 @@ HEADERS += \
 
 RESOURCES += resources/gp32emu.qrc
 
-# Qt6 audio is optional. If SDL3 development files are present, use the same
-# corrected SDL3 stream backend as the standalone SDL3 frontend. Otherwise the
-# Qt6 UI still builds and runs silently.
+# Qt6 SDL3 integration is optional. If SDL3 development files are present, use the same
+# corrected SDL3 stream backend as the standalone SDL3 frontend and enable the
+# Qt6 graphical gamepad/joystick remapper. Otherwise the Qt6 UI still builds
+# with keyboard input and without live audio/gamepad input.
 !no_sdl3_audio {
     CONFIG += link_pkgconfig
     packagesExist(sdl3) {
         PKGCONFIG += sdl3
-        DEFINES += GP32EMU_QT_SDL3_AUDIO SDL_MAIN_HANDLED
+        DEFINES += GP32EMU_QT_SDL3_AUDIO GP32EMU_QT_SDL3_INPUT SDL_MAIN_HANDLED
         SOURCES += \
             src/platform/sdl3/common.c \
             src/platform/sdl3/audio.c

@@ -4,6 +4,8 @@
 #include <QImage>
 #include <QWidget>
 
+#include <vector>
+
 extern "C" {
 #include "gp32emu/gp32.h"
 #include "gp32emu/video_effects.h"
@@ -30,6 +32,8 @@ protected:
 
 private:
     QRect imageRect() const;
+    bool copyFramebufferToImage(const gp32_framebuffer_desc_t &fb);
+    void copyRgbToImage(const uint32_t *pixels);
     QImage m_image;
     bool m_integerScaling;
     bool m_keepAspect;
@@ -37,6 +41,8 @@ private:
     bool m_frameInterpolation;
     bool m_effectsReady;
     gp32_video_effects_t m_effects;
+    std::vector<uint32_t> m_pixels;
+    std::vector<uint32_t> m_processed;
 };
 
 #endif

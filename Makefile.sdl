@@ -21,7 +21,7 @@ LIB_OBJS = \
 	src/smc_direct.o \
 	src/fxe.o \
 	src/fpk.o \
-	src/zip.o \
+	src/gp32_zip.o \
 	src/third_party/zip/zip.o \
 	src/input_script.o \
 	src/platform/platform.o \

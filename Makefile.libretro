@@ -29,7 +29,7 @@ CORE_OBJS = \
  src/smc_direct.o \
  src/fxe.o \
  src/fpk.o \
- src/zip.o \
+ src/gp32_zip.o \
  src/third_party/zip/zip.o \
  src/platform/platform.o \
  src/audio/gp32_audio_resampler.o \

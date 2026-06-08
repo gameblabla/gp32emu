@@ -58,8 +58,10 @@ signals:
 private:
     void destroyMachine();
     bool createMachine();
+    void resetAudio();
     void submitAudio();
     bool runOneFrame();
+    void scheduleNextTick(qint64 nowNs = 0);
     gp32_t *m_gp32;
     gp32_audio_backend_t *m_audio;
     QTimer m_timer;
@@ -69,11 +71,10 @@ private:
     QString m_kind;
     uint32_t m_buttons;
     uint32_t m_cycleRemainder;
-    uint64_t m_accumUnits;
+    qint64 m_nextFrameUnits;
     uint64_t m_frameIndex;
     int m_renderFrames;
     int m_emuFrames;
-    qint64 m_lastNs;
     qint64 m_fpsNs;
     bool m_running;
     bool m_jit;

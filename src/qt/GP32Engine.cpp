@@ -3,17 +3,22 @@
 #include <QFile>
 #include <QFileInfo>
 
+#include <algorithm>
 #include <cstring>
 
 static QByteArray toLocal(const QString &s) { return QFile::encodeName(s); }
 
+static constexpr qint64 GP32_QT_FRAME_UNITS = 1000000000ll; /* nanoseconds * 60 per frame */
+static constexpr qint64 GP32_QT_UNITS_PER_NS = 60ll;
+static constexpr int GP32_QT_MAX_CATCHUP_FRAMES = 1;
+
 GP32Engine::GP32Engine(QObject *parent)
     : QObject(parent), m_gp32(nullptr), m_audio(nullptr), m_buttons(0), m_cycleRemainder(0),
-      m_accumUnits(1000000ull), m_frameIndex(0), m_renderFrames(0), m_emuFrames(0),
-      m_lastNs(0), m_fpsNs(0), m_running(false), m_jit(true), m_useHle(false), m_recorder(nullptr) {
+      m_nextFrameUnits(0), m_frameIndex(0), m_renderFrames(0), m_emuFrames(0),
+      m_fpsNs(0), m_running(false), m_jit(true), m_useHle(false), m_recorder(nullptr) {
     connect(&m_timer, &QTimer::timeout, this, &GP32Engine::frameTick);
     m_timer.setTimerType(Qt::PreciseTimer);
-    m_timer.setInterval(0);
+    m_timer.setSingleShot(true);
     m_clock.start();
 }
 
@@ -23,8 +28,19 @@ void GP32Engine::destroyMachine() {
     if (m_audio) { gp32_audio_destroy(m_audio); m_audio = nullptr; }
     if (m_gp32) { gp32_destroy(m_gp32); m_gp32 = nullptr; }
     m_cycleRemainder = 0;
-    m_accumUnits = 1000000ull;
+    m_nextFrameUnits = 0;
     m_frameIndex = 0;
+}
+
+void GP32Engine::resetAudio() {
+#ifdef GP32EMU_QT_SDL3_AUDIO
+    if (m_audio) { gp32_audio_destroy(m_audio); m_audio = nullptr; }
+    gp32_audio_options_t aopt;
+    std::memset(&aopt, 0, sizeof(aopt));
+    aopt.sample_rate_hz = 44100u;
+    aopt.buffer_frames = 2048u;
+    m_audio = gp32_audio_sdl3_create(&aopt);
+#endif
 }
 
 bool GP32Engine::createMachine() {
@@ -59,17 +75,10 @@ bool GP32Engine::createMachine() {
         else if (st == GP32_OK && m_kind == "fpk") st = gp32_load_fpk(m_gp32, program.constData());
     }
     if (st != GP32_OK) { emit statusChanged(QStringLiteral("Load failed: %1").arg(QString::fromUtf8(gp32_get_error(m_gp32)))); return false; }
-#ifdef GP32EMU_QT_SDL3_AUDIO
-    gp32_audio_options_t aopt;
-    std::memset(&aopt, 0, sizeof(aopt));
-    aopt.sample_rate_hz = 44100u;
-    aopt.buffer_frames = 2048u;
-    m_audio = gp32_audio_sdl3_create(&aopt);
-    if (!m_audio) emit statusChanged("SDL3 audio unavailable");
-#endif
-    m_accumUnits = 1000000ull;
-    m_lastNs = m_clock.nsecsElapsed();
-    m_fpsNs = m_lastNs;
+    resetAudio();
+    qint64 now = m_clock.nsecsElapsed();
+    m_nextFrameUnits = now * GP32_QT_UNITS_PER_NS;
+    m_fpsNs = now;
     m_running = true;
     if (m_program.isEmpty()) emit statusChanged(QStringLiteral("Booting BIOS: %1").arg(QFileInfo(m_bios).fileName()));
     else emit statusChanged(QStringLiteral("Loaded %1 using %2").arg(QFileInfo(m_program).fileName(), useRealBios ? QStringLiteral("BIOS") : QStringLiteral("HLE BIOS")));
@@ -154,8 +163,9 @@ void GP32Engine::start() {
         return;
     }
     m_running = true;
-    m_lastNs = m_clock.nsecsElapsed();
-    m_timer.start();
+    qint64 now = m_clock.nsecsElapsed();
+    m_nextFrameUnits = now * GP32_QT_UNITS_PER_NS;
+    scheduleNextTick(now);
 }
 
 void GP32Engine::stop() {
@@ -172,7 +182,7 @@ void GP32Engine::setJitEnabled(bool enabled) {
 void GP32Engine::reset() {
     if (!m_gp32) return;
     gp32_status_t st = gp32_reset(m_gp32);
-    if (st == GP32_OK) { m_cycleRemainder = 0; m_accumUnits = 1000000ull; emit statusChanged("Reset"); }
+    if (st == GP32_OK) { m_cycleRemainder = 0; m_nextFrameUnits = m_clock.nsecsElapsed() * GP32_QT_UNITS_PER_NS; emit statusChanged("Reset"); }
     else emit statusChanged(QString::fromUtf8(gp32_get_error(m_gp32)));
 }
 
@@ -188,7 +198,13 @@ bool GP32Engine::loadState(const QString &path) {
     if (!m_gp32) return false;
     QByteArray p = toLocal(path);
     gp32_status_t st = gp32_load_state(m_gp32, p.constData());
-    if (st == GP32_OK) { m_accumUnits = 1000000ull; emit statusChanged("State loaded"); }
+    if (st == GP32_OK) {
+        gp32_clear_audio(m_gp32);
+        resetAudio();
+        m_cycleRemainder = 0;
+        m_nextFrameUnits = m_clock.nsecsElapsed() * GP32_QT_UNITS_PER_NS;
+        emit statusChanged("State loaded");
+    }
     else emit statusChanged(QString::fromUtf8(gp32_get_error(m_gp32)));
     return st == GP32_OK;
 }
@@ -252,31 +268,72 @@ bool GP32Engine::runOneFrame() {
     return true;
 }
 
+void GP32Engine::scheduleNextTick(qint64 nowNs) {
+    if (!m_running || !m_gp32) return;
+    if (nowNs <= 0) nowNs = m_clock.nsecsElapsed();
+    if (!m_nextFrameUnits) m_nextFrameUnits = nowNs * GP32_QT_UNITS_PER_NS;
+
+    qint64 diffUnits = m_nextFrameUnits - nowNs * GP32_QT_UNITS_PER_NS;
+    int delayMs = 1;
+    if (diffUnits > 0) {
+        qint64 delayNs = (diffUnits + GP32_QT_UNITS_PER_NS - 1) / GP32_QT_UNITS_PER_NS;
+        delayMs = static_cast<int>(std::max<qint64>(1, std::min<qint64>(16, delayNs / 1000000ll)));
+    }
+    m_timer.start(delayMs);
+}
+
 void GP32Engine::frameTick() {
     if (!m_running || !m_gp32) return;
+
     qint64 now = m_clock.nsecsElapsed();
-    if (!m_lastNs) m_lastNs = now;
-    qint64 elapsedNs = now - m_lastNs;
-    m_lastNs = now;
-    if (elapsedNs < 0) elapsedNs = 0;
-    if (elapsedNs > 250000000) elapsedNs = 250000000;
-    m_accumUnits += static_cast<uint64_t>(elapsedNs / 1000) * 60ull;
-    int ran = 0;
-    for (int i = 0; i < 5 && m_accumUnits >= 1000000ull; ++i) {
-        if (!runOneFrame()) break;
-        m_accumUnits -= 1000000ull;
-        ran = 1;
+    if (!m_nextFrameUnits) m_nextFrameUnits = now * GP32_QT_UNITS_PER_NS;
+
+    if (now * GP32_QT_UNITS_PER_NS < m_nextFrameUnits) {
+        scheduleNextTick(now);
+        return;
     }
-    if (m_accumUnits >= 1000000ull) m_accumUnits = 1000000ull;
+
+    int ran = 0;
+    for (int i = 0; i < GP32_QT_MAX_CATCHUP_FRAMES; ++i) {
+        if (now * GP32_QT_UNITS_PER_NS < m_nextFrameUnits && ran) break;
+        if (!runOneFrame()) return;
+        ran = 1;
+        m_nextFrameUnits += GP32_QT_FRAME_UNITS;
+        now = m_clock.nsecsElapsed();
+    }
+
+    /* Prefer lower CPU and even presentation over tight catch-up spinning.
+       If Qt wakes late, drop the accumulated debt instead of scheduling
+       zero-delay timer bursts that consume an entire core. */
+    if (now * GP32_QT_UNITS_PER_NS >= m_nextFrameUnits) {
+        m_nextFrameUnits = now * GP32_QT_UNITS_PER_NS + GP32_QT_FRAME_UNITS;
+    }
+
     if (ran) {
         gp32_framebuffer_desc_t fb;
-        if (gp32_get_framebuffer(m_gp32, &fb) == GP32_OK) { emit frameReady(fb); if (m_recorder && !gp32_media_recorder_add_frame(m_recorder, &fb, m_frameIndex ? m_frameIndex - 1ull : 0ull)) { emit statusChanged(QStringLiteral("Recording video failed: %1").arg(QString::fromUtf8(gp32_media_recorder_error(m_recorder)))); stopRecording(); } m_renderFrames++; }
+        if (gp32_get_framebuffer(m_gp32, &fb) == GP32_OK) {
+            emit frameReady(fb);
+            if (m_recorder && !gp32_media_recorder_add_frame(m_recorder, &fb, m_frameIndex ? m_frameIndex - 1ull : 0ull)) {
+                emit statusChanged(QStringLiteral("Recording video failed: %1").arg(QString::fromUtf8(gp32_media_recorder_error(m_recorder))));
+                stopRecording();
+            }
+            m_renderFrames++;
+        }
     }
+
     if (!m_fpsNs) m_fpsNs = now;
     if (now - m_fpsNs >= 1000000000ll) {
-        emit statusChanged(QStringLiteral("%1 render / %2 emu FPS | JIT %3").arg(m_renderFrames).arg(m_emuFrames).arg(m_jit ? "on" : "off"));
+        double span = static_cast<double>(now - m_fpsNs) / 1000000000.0;
+        double renderFps = span > 0.0 ? static_cast<double>(m_renderFrames) / span : 0.0;
+        double emuFps = span > 0.0 ? static_cast<double>(m_emuFrames) / span : 0.0;
+        emit statusChanged(QStringLiteral("%1 render / %2 emu FPS | JIT %3")
+                           .arg(renderFps, 0, 'f', 1)
+                           .arg(emuFps, 0, 'f', 1)
+                           .arg(m_jit ? "on" : "off"));
         m_renderFrames = 0;
         m_emuFrames = 0;
         m_fpsNs = now;
     }
+
+    scheduleNextTick(now);
 }

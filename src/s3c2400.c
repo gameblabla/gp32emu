@@ -116,6 +116,7 @@ struct s3c2400 {
 
 static uint8_t *s3c2400_fastmem(void *user, uint32_t addr, size_t bytes, int write);
 static uint32_t s3c2400_read32_io(void *user, uint32_t addr);
+static uint32_t lcd_current_line_count(const s3c2400_t *s);
 static uint32_t clk_fclk(const s3c2400_t *s, int reg);
 static uint32_t clk_hclk(const s3c2400_t *s, int reg);
 static uint32_t clk_run(const s3c2400_t *s, int reg);
@@ -539,9 +540,8 @@ static uint32_t io_read32(s3c2400_t *s, uint32_t addr) {
         off = addr - 0x14a00000u;
         uint32_t data = reg_array_read(s->lcd_regs, sizeof(s->lcd_regs), off);
         if (off == 0) {
-            uint32_t lineval = GP32_BITS(s->lcd_regs[1],23,14);
-            uint32_t linecnt = ((s->lcd_regs[0] & 1u) && s->lcd_vpos <= lineval) ? (lineval - s->lcd_vpos) : 0u;
-            data = (data & ~0xfffc0000u) | (linecnt << 18);
+            uint32_t linecnt = (s->lcd_regs[0] & 1u) ? lcd_current_line_count(s) : 0u;
+            data = (data & ~0xfffc0000u) | ((linecnt & 0x3ffu) << 18);
         }
         return data;
     }
@@ -607,9 +607,8 @@ static uint32_t s3c2400_read32_io(void *user, uint32_t addr) {
     switch (addr) {
     case 0x14a00000u: {
         uint32_t data = s->lcd_regs[0];
-        uint32_t lineval = GP32_BITS(s->lcd_regs[1], 23, 14);
-        uint32_t linecnt = ((data & 1u) && s->lcd_vpos <= lineval) ? (lineval - s->lcd_vpos) : 0u;
-        return (data & ~0xfffc0000u) | (linecnt << 18);
+        uint32_t linecnt = (data & 1u) ? lcd_current_line_count(s) : 0u;
+        return (data & ~0xfffc0000u) | ((linecnt & 0x3ffu) << 18);
     }
     case 0x15100014u: return pwm_current_count(s, 0u);
     case 0x15100020u: return pwm_current_count(s, 1u);
@@ -689,11 +688,30 @@ static void io_write32(s3c2400_t *s, uint32_t addr, uint32_t value, uint32_t mas
     }
     if (addr >= 0x14600000u && addr <= 0x1460007bu) {
         off=addr-0x14600000u; uint32_t old=reg_array_read(s->dma,sizeof(s->dma),off); reg_array_write(s->dma,sizeof(s->dma),off,value,mask);
-        if ((off==0x08u||off==0x28u||off==0x48u||off==0x68u) && GP32_BIT(value,22)) {
-            unsigned trig_off = (off & ~0x1fu) + 0x18u;
-            s->dma[trig_off >> 2] &= ~(1u << 1);
+        /* DCON[22] is the reload-off option. It must not disable an
+         * already-running channel when software writes DCON: hardware turns
+         * the request off only when the current transfer count reaches zero.
+         * Several BIOS-driven games rewrite DCON with reload-off while the
+         * final audio DMA block is still draining. Clearing DMASKTRIG here
+         * drops the terminal-count DMA interrupt and can stop streamed music. */
+        if (off==0x18u||off==0x38u||off==0x58u||off==0x78u) {
+            int ch = (int)(off >> 5);
+            uint32_t *dr = &s->dma[ch << 3];
+            uint32_t now = dr[6];
+            if ((mask & 4u) && (now & 4u)) {
+                /* DMASKTRIG[2] STOP forces the channel off after the current
+                 * atomic transfer. DMA transfers are modeled atomically here,
+                 * so complete the stop immediately and clear the current
+                 * transfer registers as the hardware documents. */
+                dr[3] = 0;
+                dr[4] = 0;
+                dr[5] = 0;
+                dr[6] &= ~2u;
+            } else if (((old ^ now) & 2u) && (now & 2u)) {
+                if (!GP32_BIT(dr[2], 23)) dr[6] &= ~1u; /* SW_TRIG is self-clearing when accepted. */
+                dma_start(s, ch);
+            }
         }
-        if ((off==0x18u||off==0x38u||off==0x58u||off==0x78u) && ((old^value)&2u) && (value&2u)) dma_start(s,(int)(off>>5));
         return;
     }
     if (addr >= 0x14800000u && addr <= 0x14800017u) { reg_array_write(s->clkpow,sizeof(s->clkpow),addr-0x14800000u,value,mask); s->iis_clock_dirty = 1; s->pwm_clock_dirty = 1; return; }
@@ -702,10 +720,8 @@ static void io_write32(s3c2400_t *s, uint32_t addr, uint32_t value, uint32_t mas
         uint32_t old = reg_array_read(s->lcd_regs, sizeof(s->lcd_regs), off);
         reg_array_write(s->lcd_regs, sizeof(s->lcd_regs), off, value, mask);
         uint32_t now = reg_array_read(s->lcd_regs, sizeof(s->lcd_regs), off);
-        if ((off <= 0x0cu && old != now) || (off == 0u && ((old ^ now) & 1u))) {
-            s->lcd_vpos = 0;
-            s->lcd_line_accum = 0;
-        }
+        (void)old;
+        (void)now;
         if (off == 0u) s3c2400_render_lcd(s);
         return;
     }
@@ -779,7 +795,7 @@ uint32_t s3c2400_read32(void *user, uint32_t addr) {
     if (addr+3u < BIOS_SIZE) return gp32_ld32le(&s->bios[addr]);
     uint8_t *p=ram_ptr(s,addr,4); if(p) return gp32_ld32le(p);
     if ((addr & 3u)==0) {
-        if (addr == 0x14a00000u) { uint32_t data = s->lcd_regs[0]; uint32_t lineval = GP32_BITS(s->lcd_regs[1],23,14); uint32_t linecnt = ((data & 1u) && s->lcd_vpos <= lineval) ? (lineval - s->lcd_vpos) : 0u; return (data & ~0xfffc0000u) | (linecnt << 18); }
+        if (addr == 0x14a00000u) { uint32_t data = s->lcd_regs[0]; uint32_t linecnt = (data & 1u) ? lcd_current_line_count(s) : 0u; return (data & ~0xfffc0000u) | ((linecnt & 0x3ffu) << 18); }
         return io_read32(s,addr);
     }
     return (uint32_t)s3c2400_read8(user,addr) | ((uint32_t)s3c2400_read8(user,addr+1)<<8) | ((uint32_t)s3c2400_read8(user,addr+2)<<16) | ((uint32_t)s3c2400_read8(user,addr+3)<<24);
@@ -986,53 +1002,39 @@ void s3c2400_audio_append_s16_stereo(s3c2400_t *s, int16_t left, int16_t right, 
     audio_append_stereo(s, left, right);
 }
 
-static uint32_t lcd_total_lines(const s3c2400_t *s) {
-    uint32_t lineval = GP32_BITS(s->lcd_regs[1], 23, 14) + 1u;
-    uint32_t vbpd = GP32_BITS(s->lcd_regs[1], 31, 24) + 1u;
-    uint32_t vfpd = GP32_BITS(s->lcd_regs[1], 13, 6) + 1u;
-    uint32_t vspw = GP32_BITS(s->lcd_regs[1], 5, 0) + 1u;
-    uint32_t total = lineval + vbpd + vfpd + vspw;
-    return total ? total : 1u;
-}
 
-static uint64_t lcd_cycles_per_line(const s3c2400_t *s) {
-    uint32_t runclk = clk_run(s, MPLLCON);
-    uint32_t hclk = clk_hclk(s, MPLLCON);
-    if (!runclk) runclk = 40000000u;
-    if (!hclk) hclk = runclk;
+static uint32_t lcd_current_line_count(const s3c2400_t *s) {
+    if (!s) return 0u;
+    uint32_t lineval = GP32_BITS(s->lcd_regs[1], 23, 14);
+    uint32_t visible = lineval + 1u;
+    if (visible == 0u || visible > 1024u) visible = 320u;
 
-    uint32_t clkval = GP32_BITS(s->lcd_regs[0], 17, 8) + 1u;
-    uint32_t hozval = GP32_BITS(s->lcd_regs[2], 18, 8) + 1u;
-    uint32_t hbpd = GP32_BITS(s->lcd_regs[2], 25, 19) + 1u;
-    uint32_t hfpd = GP32_BITS(s->lcd_regs[2], 7, 0) + 1u;
-    uint32_t hspw = GP32_BITS(s->lcd_regs[3], 7, 0) + 1u;
-    uint32_t hpixels = hozval + hbpd + hfpd + hspw;
-    if (!hpixels) hpixels = 1u;
+    uint32_t fclk = clk_fclk(s, MPLLCON);
+    if (!fclk) fclk = 66000000u;
 
-    /* TFT VCLK is derived from the LCD bus clock by 2 * (CLKVAL + 1).
-     * Keep LCD status polling tied to emulated cycles, not to the number of
-     * register reads. The previous read-advanced fake line counter let BIOS
-     * surface-flip/vblank waits complete as quickly as the host/JIT could poll.
+    /*
+     * LCDCON1[27:18] is polled by the GP32 BIOS and by BIOS-booted games as
+     * a vblank/status countdown.  Do not derive this field from the raw
+     * programmed VCLK/porch values: several commercial titles program LCDCON
+     * values that decode to an about-89 Hz controller cadence, and their BIOS
+     * boot path then services streamed IIS/DMA audio too slowly or at the
+     * wrong time.  v36 used an elapsed-cycle, panel-cadence status counter;
+     * keep that behaviour here so tight LCDCON1 polling loops observe a stable
+     * 60 Hz GP32 panel frame instead of a poll-frequency or VCLK artifact.
      */
-    uint64_t num = (uint64_t)runclk * (uint64_t)clkval * 2ull * (uint64_t)hpixels;
-    uint64_t den = (uint64_t)hclk;
-    uint64_t period = den ? (num + den - 1u) / den : num;
-    return period ? period : 1u;
-}
+    uint64_t frame_cycles = ((uint64_t)fclk + 30u) / 60u;
+    if (!frame_cycles) frame_cycles = 1u;
+    uint32_t vblank_lines = (visible / 16u) + 8u;
+    if (vblank_lines < 8u) vblank_lines = 8u;
+    uint32_t total_lines = visible + vblank_lines;
+    if (total_lines <= visible) total_lines = visible + 1u;
+    uint64_t line_cycles = frame_cycles / total_lines;
+    if (!line_cycles) line_cycles = 1u;
 
-static void lcd_tick(s3c2400_t *s, uint32_t cpu_cycles) {
-    if (!s || !cpu_cycles || !(s->lcd_regs[0] & 1u)) {
-        if (s) { s->lcd_line_accum = 0; s->lcd_vpos = 0; }
-        return;
-    }
-    uint64_t period = lcd_cycles_per_line(s);
-    uint32_t total_lines = lcd_total_lines(s);
-    s->lcd_line_accum += (uint64_t)cpu_cycles;
-    if (s->lcd_line_accum >= period) {
-        uint64_t lines = s->lcd_line_accum / period;
-        s->lcd_line_accum -= lines * period;
-        s->lcd_vpos = (uint32_t)(((uint64_t)s->lcd_vpos + lines) % (uint64_t)total_lines);
-    }
+    uint64_t line64 = (s->lcd_line_accum % frame_cycles) / line_cycles;
+    uint32_t line = (line64 >= total_lines) ? (total_lines - 1u) : (uint32_t)line64;
+    if (line >= visible) return 0u;
+    return (visible - 1u) - line;
 }
 
 static void iis_fifo_write16(s3c2400_t *s, uint16_t sample) {
@@ -1122,7 +1124,7 @@ static void dma_request_pwm(s3c2400_t *s) {
 
 void s3c2400_tick(s3c2400_t *s, uint32_t cpu_cycles) {
     if (!s || !cpu_cycles) return;
-    lcd_tick(s, cpu_cycles);
+    s->lcd_line_accum += (uint64_t)cpu_cycles;
     if (s->iis[0] & 1u) {
         iis_refresh_clock_cache(s);
         uint64_t period = s->iis_cached_period_cycles ? s->iis_cached_period_cycles : 1u;
@@ -1369,8 +1371,6 @@ int s3c2400_state_load(s3c2400_t *s, FILE *f) {
     memcpy(s->mmc, st->mmc, sizeof(s->mmc));
     s->lcd = st->lcd;
     s->smc_lines = st->smc_lines;
-    if (s->cpu_irq_sink) {
-        arm920t_set_irq(s->cpu_irq_sink, (s->irq[4] & ~s->irq[0]) != 0u);
-    }
+    check_irq(s);
     return 1;
 }
