@@ -1,0 +1,13 @@
+*.o
+*.a
+build*
+third_party/sdl/build/
+third_party/sdl/install/
+third_party/sdl/SDL3-3.4.10/
+build-appimage/
+build/
+build-wasm/
+*.zip
+*.gp32st
+web/*.wasm
+.qmake.stash
