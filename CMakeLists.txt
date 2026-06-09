@@ -18,7 +18,7 @@ add_library(gp32emu
     src/smc_direct.c
     src/fxe.c
     src/fpk.c
-    src/zip.c
+    src/gp32_zip.c
     src/third_party/zip/zip.c
     src/input_script.c
     src/platform/platform.c

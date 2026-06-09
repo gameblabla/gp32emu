@@ -79,55 +79,6 @@ make -f Makefile.win64 GP32EMU_ENABLE_THREADS=0
 cmake -S . -B build -DGP32EMU_ENABLE_THREADS=OFF
 ```
 
-## CPU execution modes
-
-`--no-jit` now uses the portable bytecode interpreter. ARM instructions are decoded into cached basic blocks and executed by C11 bytecode helpers, so the path remains architecture-neutral and accurate while avoiding repeated instruction decode and MMIO/addressing classification. This is the default portable CPU path on non-x86_64 hosts and when the Win64/SDL/Qt JIT option is disabled.
-
-`--jit` still enables the x86_64 native dynarec when executable memory and direct RAM/BIOS fastmem are available. If native JIT cannot be enabled, the core falls back to the same portable bytecode interpreter.
-
-## Frontend features
-
-The Win64 and Qt6/Linux frontends provide BIOS path configuration, automatic HLE BIOS fallback when no BIOS is configured, save/load state, screenshots, start/stop MKV recording, fullscreen, aspect-ratio scaling, integer scaling, optional LCD persistence / FLU ghosting, optional frame interpolation blending, JIT enable/disable with core reset, and WaveOut/WASAPI audio selection on Win64. WaveOut is the default Win64 audio backend. Live audio backends share the same streaming fractional resampler with queue-drift correction and short de-click fades after underruns. On threaded Win64 builds, waveOut/WASAPI are also pumped from a small MMCSS-priority worker thread so UI/render stalls are less likely to starve the audio device.
-
-HLE BIOS is a fallback, not a preferred boot mode. When a real BIOS path is configured, Qt6/Linux and Win64 force normal BIOS boot for games and disable the HLE fallback menu toggle. If the BIOS path is cleared or missing, HLE fallback is enabled automatically so compatible games can still boot. It can boot selected commercial games and homebrew, and it can fail on other commercial titles. Configure a real BIOS for best compatibility.
-
-## Recording format
-
-Recording writes an MKV container containing:
-
-- ZMBV 320x240 video frames;
-- 16-bit stereo PCM audio at 44100 Hz.
-
-The bundled ZMBV encoder is a small emulator-specific encoder, not a full FFmpeg dependency. On threaded builds, compression and MKV writes run on a recorder worker queue; if the worker falls behind, video frames can be dropped rather than blocking emulation/audio.
-
-WASM frontend v95 notes:
-- The main browser loop is now presentation-time limited instead of audio-queue limited, eliminating the prior 3-6 frame audio fill bursts that caused visible video frame skipping.
-- The renderer caches the video layout and avoids per-frame `getBoundingClientRect()`/canvas resize work; sharp-bilinear pre-scaling is capped to keep high-DPI mobile fullscreen from forcing very large canvas blits every frame.
-- FPS/PC video overlay is off by default and can be enabled from the Status panel; when enabled, displayed FPS is capped to the GP32 60 Hz video cadence.
-- Mobile touch overlay can be disabled from the Input panel for external gamepad use.
-- Touch L/R shoulders are slightly lower and wider to avoid the fullscreen/menu buttons.
-- Video options include integer scale, keep-aspect scaling, stretch scaling, nearest-neighbor filtering, linear filtering, and sharp-bilinear filtering for smoother scrolling without fully blurred pixels.
-- The WASM frontend pauses by default while the browser tab is inactive. This can be disabled from the Video panel.
-
-WASM frontend v96 notes:
-- The video path now prefers WebGL for the 320x240 framebuffer upload and scaling pass, with automatic Canvas2D fallback when WebGL is unavailable. This reduces CPU-side canvas work, especially with keep-aspect/stretch/fullscreen and sharp-bilinear modes.
-- The Status panel's frame/PC labels and audio queue label are throttled to avoid per-frame DOM writes during gameplay. This reduces main-thread layout pressure without changing the AudioWorklet jitter buffer or resampler path.
-- The WASM ARM block cache is larger and allows longer translated blocks for fewer dispatcher returns in larger commercial games.
-- Little Wizard was used as the WASM benchmark path for this pass.
-
-
-
-Frontend boot-policy / Qt project v103 notes:
-- Restored `GP32emu.pro` to valid qmake syntax. It had accidentally been replaced with CMake syntax in the previous package, causing `option() requires one literal argument` and `Missing closing parenthesis` errors under qmake.
-- Qt6/Linux and Win64 now prefer the configured real BIOS unconditionally. Stale saved HLE settings are ignored once a BIOS path exists.
-- Setting or opening a BIOS path turns HLE fallback off and persists that state. Clearing the BIOS path turns the fallback back on.
-
-Frontend video effects v97 notes:
-- Added shared 320x240 temporal video post-processing used by WASM, SDL 1.2, SDL3, Qt6/Linux, and Win64.
-- LCD persistence is a mild FLU-style response/ghosting blend intended to mimic the original GP32 front-lit LCD.
-- Frame interpolation blends adjacent presented frames to smooth pixel-art motion without changing emulator timing.
-- Both effects are optional and disabled by default. WASM/Qt/Win64 expose menu checkboxes; SDL frontends expose `--lcd-persistence` and `--frame-interpolation`.
-
 ## Libretro backend
 
 This source package includes a separate libretro backend. It does not replace the SDL, Qt, Win64, or WASM frontends.
