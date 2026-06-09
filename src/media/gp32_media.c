@@ -35,6 +35,9 @@ int mz_compress2(unsigned char *pDest, mz_ulong *pDest_len, const unsigned char 
 #define ZMBV_BLOCK 16u
 #define ZMBV_FMT_32BPP 8u
 #define ZMBV_KEYFRAME 1u
+#define GP32_MKV_TIMECODE_SCALE_NS 100000u
+#define GP32_MKV_TIMECODE_TICKS_PER_SECOND (1000000000ull / GP32_MKV_TIMECODE_SCALE_NS)
+#define GP32_MKV_CLUSTER_MAX_TICKS 30000ull
 
 static void seterr(char *err, size_t err_len, const char *msg) {
     if (err && err_len) {
@@ -171,6 +174,8 @@ struct gp32_media_recorder {
     FILE *f;
     uint32_t audio_rate;
     uint64_t audio_frames_out;
+    uint64_t video_frame_base;
+    int have_video_frame_base;
     uint64_t current_cluster_ms;
     int cluster_open;
     char err[256];
@@ -181,6 +186,8 @@ struct gp32_media_recorder {
     uint32_t *frame;
     int16_t *audio_tmp;
     size_t audio_tmp_cap;
+    int16_t *silence_tmp;
+    size_t silence_tmp_cap;
     gp32_audio_resampler_t audio_resampler;
 #if GP32EMU_ENABLE_THREADS
     int threaded;
@@ -268,7 +275,7 @@ static int write_header(gp32_media_recorder_t *r) {
     if (!mb_ebml_uint(&ebml, 0x4286, 1) || !mb_ebml_uint(&ebml, 0x42F7, 1) || !mb_ebml_uint(&ebml, 0x42F2, 4) || !mb_ebml_uint(&ebml, 0x42F3, 8) || !mb_ebml_str(&ebml, 0x4282, "matroska") || !mb_ebml_uint(&ebml, 0x4287, 4) || !mb_ebml_uint(&ebml, 0x4285, 2)) goto done;
     ebml_id(f, 0x1A45DFA3); ebml_size(f, ebml.n); fwrite(ebml.p, 1, ebml.n, f);
     ebml_id(f, 0x18538067); ebml_unknown_size8(f);
-    if (!mb_ebml_uint(&info, 0x2AD7B1, 1000000) || !mb_ebml_str(&info, 0x4D80, "GP32emu") || !mb_ebml_str(&info, 0x5741, "GP32emu ZMBV recorder")) goto done;
+    if (!mb_ebml_uint(&info, 0x2AD7B1, GP32_MKV_TIMECODE_SCALE_NS) || !mb_ebml_str(&info, 0x4D80, "GP32emu") || !mb_ebml_str(&info, 0x5741, "GP32emu ZMBV recorder")) goto done;
     ebml_id(f, 0x1549A966); ebml_size(f, info.n); fwrite(info.p, 1, info.n, f);
 
     /* BITMAPINFOHEADER codec private for V_MS/VFW/FOURCC ZMBV. */
@@ -288,19 +295,19 @@ done:
     return ok;
 }
 
-static int ensure_cluster(gp32_media_recorder_t *r, uint64_t timestamp_ms) {
-    if (!r->cluster_open || timestamp_ms < r->current_cluster_ms || timestamp_ms - r->current_cluster_ms > 30000ull) {
+static int ensure_cluster(gp32_media_recorder_t *r, uint64_t timestamp_ticks) {
+    if (!r->cluster_open || timestamp_ticks < r->current_cluster_ms || timestamp_ticks - r->current_cluster_ms > GP32_MKV_CLUSTER_MAX_TICKS) {
         ebml_id(r->f, 0x1F43B675); ebml_unknown_size8(r->f);
-        r->current_cluster_ms = timestamp_ms;
-        ebml_uint(r->f, 0xE7, timestamp_ms);
+        r->current_cluster_ms = timestamp_ticks;
+        ebml_uint(r->f, 0xE7, timestamp_ticks);
         r->cluster_open = 1;
     }
     return ferror(r->f) == 0;
 }
 
-static int write_simple_block(gp32_media_recorder_t *r, uint8_t track, uint64_t timestamp_ms, uint8_t flags, const void *data, size_t bytes) {
-    if (!ensure_cluster(r, timestamp_ms)) return 0;
-    int64_t rel = (int64_t)timestamp_ms - (int64_t)r->current_cluster_ms;
+static int write_simple_block(gp32_media_recorder_t *r, uint8_t track, uint64_t timestamp_ticks, uint8_t flags, const void *data, size_t bytes) {
+    if (!ensure_cluster(r, timestamp_ticks)) return 0;
+    int64_t rel = (int64_t)timestamp_ticks - (int64_t)r->current_cluster_ms;
     if (rel < -32768 || rel > 32767) { rec_seterr(r, "Matroska relative timestamp overflow"); return 0; }
     ebml_id(r->f, 0xA3);
     ebml_size(r->f, bytes + 4u);
@@ -345,6 +352,42 @@ static int ensure_zbuf(gp32_media_recorder_t *r, size_t raw) {
     return 1;
 }
 
+
+static uint64_t rec_frame_to_audio_frames(const gp32_media_recorder_t *r, uint64_t rel_frame) {
+    if (!r || !r->audio_rate) return 0;
+    if (rel_frame > (UINT64_MAX - 30ull) / (uint64_t)r->audio_rate) return UINT64_MAX;
+    return (rel_frame * (uint64_t)r->audio_rate + 30ull) / 60ull;
+}
+
+static int ensure_silence_tmp(gp32_media_recorder_t *r, size_t frames) {
+    size_t samples = frames * 2u;
+    if (samples <= r->silence_tmp_cap) return 1;
+    int16_t *p = (int16_t *)realloc(r->silence_tmp, samples * sizeof(int16_t));
+    if (!p) return 0;
+    memset(p, 0, samples * sizeof(int16_t));
+    r->silence_tmp = p;
+    r->silence_tmp_cap = samples;
+    return 1;
+}
+
+static int gp32_media_recorder_write_silence_sync(gp32_media_recorder_t *r, uint64_t target_audio_frames) {
+    if (!r || !r->audio_rate) return 1;
+    static const size_t max_chunk_frames = 4096u;
+    while (r->audio_frames_out < target_audio_frames) {
+        uint64_t remain64 = target_audio_frames - r->audio_frames_out;
+        size_t chunk = remain64 > (uint64_t)max_chunk_frames ? max_chunk_frames : (size_t)remain64;
+        if (!chunk) break;
+        if (!ensure_silence_tmp(r, chunk)) { rec_seterr(r, "out of memory padding recorder audio"); return 0; }
+        uint64_t ts = (r->audio_frames_out * GP32_MKV_TIMECODE_TICKS_PER_SECOND) / r->audio_rate;
+        if (!write_simple_block(r, 2u, ts, 0x80u, r->silence_tmp, chunk * 2u * sizeof(int16_t))) {
+            rec_seterr(r, "failed to write silence audio block");
+            return 0;
+        }
+        r->audio_frames_out += chunk;
+    }
+    return 1;
+}
+
 static int gp32_media_recorder_add_frame_sync(gp32_media_recorder_t *r, const gp32_framebuffer_desc_t *fb, uint64_t frame_index) {
     if (!r || !fb) return 0;
     const size_t pixels = (size_t)GP32_MEDIA_LCD_W * GP32_MEDIA_LCD_H;
@@ -366,7 +409,14 @@ static int gp32_media_recorder_add_frame_sync(gp32_media_recorder_t *r, const gp
     packet[0] = ZMBV_KEYFRAME;
     packet[1] = 0; packet[2] = 1; packet[3] = 1; packet[4] = ZMBV_FMT_32BPP; packet[5] = ZMBV_BLOCK; packet[6] = ZMBV_BLOCK;
     memcpy(packet + 7, r->zcomp, (size_t)comp_len);
-    uint64_t ts = (frame_index * 1000ull) / 60ull;
+    if (!r->have_video_frame_base) {
+        r->video_frame_base = frame_index;
+        r->have_video_frame_base = 1;
+    }
+    uint64_t rel_frame = frame_index >= r->video_frame_base ? frame_index - r->video_frame_base : 0ull;
+    uint64_t audio_target = rec_frame_to_audio_frames(r, rel_frame + 1ull);
+    if (!gp32_media_recorder_write_silence_sync(r, audio_target)) { free(packet); return 0; }
+    uint64_t ts = (rel_frame * GP32_MKV_TIMECODE_TICKS_PER_SECOND + 30ull) / 60ull;
     int ok = write_simple_block(r, 1u, ts, 0x80u, packet, packet_len);
     free(packet);
     if (!ok) rec_seterr(r, "failed to write video block");
@@ -403,7 +453,7 @@ static int gp32_media_recorder_add_audio_sync(gp32_media_recorder_t *r, const gp
                                                      r->audio_tmp,
                                                      max_out);
     if (out_frames == 0) return 1;
-    uint64_t ts = (r->audio_frames_out * 1000ull) / r->audio_rate;
+    uint64_t ts = (r->audio_frames_out * GP32_MKV_TIMECODE_TICKS_PER_SECOND) / r->audio_rate;
     r->audio_frames_out += out_frames;
     if (!write_simple_block(r, 2u, ts, 0x80u, r->audio_tmp, out_frames * 2u * sizeof(int16_t))) { rec_seterr(r, "failed to write audio block"); return 0; }
     return 1;
@@ -623,7 +673,7 @@ int gp32_media_recorder_close(gp32_media_recorder_t *r) {
 #if GP32EMU_ENABLE_THREADS
     if (r->async_failed) ok = 0;
 #endif
-    free(r->zwork); free(r->zcomp); free(r->frame); free(r->audio_tmp); free(r);
+    free(r->zwork); free(r->zcomp); free(r->frame); free(r->audio_tmp); free(r->silence_tmp); free(r);
     return ok;
 }
 
@@ -633,5 +683,5 @@ void gp32_media_recorder_abort(gp32_media_recorder_t *r) {
     gp32_media_recorder_stop_worker(r, 0);
 #endif
     if (r->f) fclose(r->f);
-    free(r->zwork); free(r->zcomp); free(r->frame); free(r->audio_tmp); free(r);
+    free(r->zwork); free(r->zcomp); free(r->frame); free(r->audio_tmp); free(r->silence_tmp); free(r);
 }
