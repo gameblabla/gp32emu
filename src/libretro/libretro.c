@@ -236,7 +236,11 @@ void retro_set_environment(retro_environment_t cb) {
     bool no_game = false;
     if (environ_cb) environ_cb(RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME, &no_game);
     static const struct retro_variable vars[] = {
+#if defined(GP32EMU_INTERPRETER_ONLY) && GP32EMU_INTERPRETER_ONLY
+        { "gp32emu_jit", "Dynamic recompiler; disabled" },
+#else
         { "gp32emu_jit", "Dynamic recompiler; enabled|disabled" },
+#endif
         { "gp32emu_boot_mode", "Boot mode; auto|require_bios|direct_hle" },
         { "gp32emu_lcd_persistence", "LCD persistence / GP32 FLU ghosting; disabled|enabled" },
         { "gp32emu_frame_interpolation", "Frame interpolation; disabled|enabled" },
