@@ -19,6 +19,14 @@ else
 LIBRETRO_EXT ?= so
 SHARED_FLAGS ?= -shared -Wl,--no-undefined
 endif
+ifeq ($(platform),ios-arm64)
+IOS_DEPLOYMENT_TARGET ?= 15.0
+IOS_SDKROOT ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
+CC := $(shell xcrun --sdk iphoneos --find clang)
+IOS_FLAGS := -target arm64-apple-ios$(IOS_DEPLOYMENT_TARGET) -isysroot "$(IOS_SDKROOT)" -DGP32EMU_INTERPRETER_ONLY=1
+LIBRETRO_EXT := dylib
+SHARED_FLAGS := -dynamiclib
+endif
 TARGET_NAME ?= gp32emu_libretro
 TARGET_FILE := $(TARGET_NAME).$(LIBRETRO_EXT)
 CORE_OBJS = \
@@ -40,10 +48,10 @@ ZIPLIB_CFLAGS ?= $(filter-out -Werror,$(CFLAGS)) -D_XOPEN_SOURCE=700 -D_FILE_OFF
 .PHONY: all clean
 all: $(TARGET_FILE)
 $(TARGET_FILE): $(CORE_OBJS) $(LIBRETRO_OBJS)
-	$(CC) $(SHARED_FLAGS) -o $@ $^ $(THREAD_LIBS) -lm
+	$(CC) $(SHARED_FLAGS) $(IOS_FLAGS) -o $@ $^ $(THREAD_LIBS) -lm
 src/third_party/zip/zip.o: src/third_party/zip/zip.c src/third_party/zip/zip.h src/third_party/zip/miniz.h
-	$(CC) $(ZIPLIB_CFLAGS) $(THREAD_CFLAGS) $(CPPFLAGS) -c -o $@ $<
+	$(CC) $(ZIPLIB_CFLAGS) $(IOS_FLAGS) $(THREAD_CFLAGS) $(CPPFLAGS) -c -o $@ $<
 %.o: %.c
-	$(CC) $(CFLAGS) $(THREAD_CFLAGS) $(CPPFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(IOS_FLAGS) $(THREAD_CFLAGS) $(CPPFLAGS) -c -o $@ $<
 clean:
 	rm -f $(CORE_OBJS) $(LIBRETRO_OBJS) $(TARGET_FILE)

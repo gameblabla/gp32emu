@@ -94,3 +94,22 @@ retroarch --verbose -L ./gp32emu_libretro.so "Little Wizard (Europe).smc"
 ```
 
 Also make sure the core path includes either an absolute path or `./`. On Linux, `gp32emu_libretro.so` without a slash may be interpreted as a core name or searched through RetroArch's configured core directories rather than the current directory.
+
+## iOS arm64
+
+On macOS with Xcode and the iPhoneOS SDK installed:
+
+```sh
+make -f Makefile.libretro clean
+make -f Makefile.libretro platform=ios-arm64
+```
+
+This produces `gp32emu_libretro.dylib` for physical arm64 iOS devices,
+with a default minimum iOS version of 15.0. Set `IOS_DEPLOYMENT_TARGET`
+to change the minimum version, or `IOS_SDKROOT` to select another
+installed iPhoneOS SDK. Clean before switching between host and iOS builds.
+
+The iOS target forces interpreter-only execution and exposes only the disabled
+JIT option. Saved core options cannot re-enable executable code generation.
+Embed and sign the core with the iOS frontend; iOS cannot load an unsigned core
+copied into an application's writable data directory.

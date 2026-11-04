@@ -426,6 +426,9 @@ void arm920t_reset(arm920t_t *c, uint32_t vector) {
 void arm920t_set_irq(arm920t_t *c, int state) { if (c) c->irq_line = state != 0; }
 void arm920t_set_fiq(arm920t_t *c, int state) { if (c) c->fiq_line = state != 0; }
 void arm920t_set_jit(arm920t_t *c, int enabled) {
+#if defined(GP32EMU_INTERPRETER_ONLY) && GP32EMU_INTERPRETER_ONLY
+    enabled = 0;
+#endif
     if (c) {
         c->jit_enabled = enabled != 0;
         if (c->jit_enabled) {
